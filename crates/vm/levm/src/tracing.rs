@@ -192,6 +192,17 @@ impl LevmCallTracer {
         if error.is_some() {
             self.failed_nested_calls = self.failed_nested_calls.saturating_add(1);
         }
+        self.exit_early_uncounted(gas_used, error)
+    }
+
+    /// Like [`LevmCallTracer::exit_early`], but not counted as a failed nested call. For a
+    /// CREATE stopped by a check that, from Amsterdam (EIP-8037), the creating frame runs
+    /// before the creation starts.
+    pub fn exit_early_uncounted(
+        &mut self,
+        gas_used: u64,
+        error: Option<String>,
+    ) -> Result<(), InternalError> {
         if !self.active {
             return Ok(());
         }

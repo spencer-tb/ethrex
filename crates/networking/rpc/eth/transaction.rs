@@ -2184,4 +2184,63 @@ mod estimate_gas_failed_nested_call_tests {
             "estimate {gas} reaches past 2^24 to fund the nested call from the reservoir"
         );
     }
+
+    /// The failed nested calls the estimator counts when `CALLER` runs `code` with no
+    /// balance, on `genesis`.
+    async fn failed_nested_calls(genesis: &str, code: &str) -> u64 {
+        use bytes::Bytes;
+        use ethrex_common::Address;
+        use ethrex_common::types::{GenericTransaction, GenesisAccount, TxKind};
+        use ethrex_vm::backends::ExecutionGasCap;
+
+        let caller = Address::from_str(CALLER).unwrap();
+        let mut genesis: Genesis = serde_json::from_str(genesis).expect("test genesis is invalid");
+        genesis.alloc.insert(
+            caller,
+            GenesisAccount {
+                code: Bytes::from(hex::decode(code.trim_start_matches("0x")).unwrap()),
+                storage: Default::default(),
+                balance: U256::zero(),
+                nonce: 0,
+            },
+        );
+        let mut store =
+            Store::new("test-store", EngineType::InMemory).expect("Fail to create in-memory db");
+        store.add_initial_state(genesis).await.unwrap();
+        let header = store.get_block_header(0).unwrap().expect("genesis header");
+        let context = default_context_with_storage(store.clone()).await;
+        let call = GenericTransaction {
+            from: Address::from_str(SENDER).unwrap(),
+            to: TxKind::Call(caller),
+            gas: Some(1_000_000),
+            ..Default::default()
+        };
+        let (_, failed) = super::simulate_tx_counting_failed_calls(
+            &call,
+            &header,
+            None,
+            store,
+            context.blockchain.clone(),
+            None,
+            ExecutionGasCap::Enforced,
+        )
+        .unwrap();
+        failed
+    }
+
+    /// A nested CALL stopped by its balance check counts as a failed nested call in every
+    /// fork. A CREATE stopped by its balance check counts only before Amsterdam: from
+    /// EIP-8037 the creating frame runs that check before the creation starts, and geth
+    /// counts neither the check nor a creation that never starts.
+    #[tokio::test]
+    async fn a_create_stopped_before_it_starts_counts_only_before_amsterdam() {
+        // With no balance: `PUSH1 0 PUSH1 0 PUSH1 1 CREATE POP`, then
+        // `PUSH1 0 (x4) PUSH1 1 PUSH20 burner GAS CALL POP`, then `STOP`. Both send 1 wei.
+        let code = format!(
+            "0x600060006001f0506000600060006000600173{}5af15000",
+            &BURNER[2..]
+        );
+        assert_eq!(failed_nested_calls(OSAKA_GENESIS, &code).await, 2);
+        assert_eq!(failed_nested_calls(AMSTERDAM_GENESIS, &code).await, 1);
+    }
 }
