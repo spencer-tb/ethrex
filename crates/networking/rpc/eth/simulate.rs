@@ -1198,6 +1198,48 @@ mod integration_tests {
         );
     }
 
+    /// Neither mode caps a call's gas limit per transaction: not at 2^24 before Amsterdam
+    /// (EIP-7825), nor at 2^32 - 1 after it (EIP-8037), as geth does not.
+    #[tokio::test]
+    async fn per_transaction_gas_limit_caps_do_not_apply() {
+        let request = |validation: bool, gas: &str, block_gas_limit: Option<&str>| {
+            let mut block = json!({
+                "calls": [{
+                    "from": RICH,
+                    "to": FRESH_B,
+                    "nonce": "0x0",
+                    "gas": gas,
+                    "maxFeePerGas": "0x77359400",
+                }],
+            });
+            if let Some(limit) = block_gas_limit {
+                block["blockOverrides"] = json!({"gasLimit": limit});
+            }
+            json!([{"validation": validation, "blockStateCalls": [block]}, "latest"])
+        };
+        for validation in [false, true] {
+            // 20M: above 2^24, within the 25M block.
+            let result = simulate(request(validation, "0x1312d00", None))
+                .await
+                .unwrap();
+            assert_eq!(
+                result[0]["calls"][0]["status"], "0x1",
+                "Osaka, validation {validation}: {result}"
+            );
+            // 2^32 in a block that fits it, with no RPC gas cap to lower it.
+            let result = simulate_amsterdam_with_gas_cap(
+                request(validation, "0x100000000", Some("0x200000000")),
+                0,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result[0]["calls"][0]["status"], "0x1",
+                "Amsterdam, validation {validation}: {result}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn explicit_gas_above_block_limit_aborts() {
         // `ethSimulate-run-out-of-gas-in-block-38015.io` (adapted): a small

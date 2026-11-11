@@ -3577,6 +3577,11 @@ impl LEVM {
         // enforcement only applies with `validation: true`.
         env.disable_sender_eoa_check = true;
         env.disable_nonce_check = !validate;
+        // The per-transaction gas limit caps (EIP-7825, and the EIP-8037 total cap after
+        // Amsterdam) are skipped in both modes, as geth skips them for every simulated
+        // call. The block gas limit still holds: `simulate_v1` refuses a call that does not
+        // fit the block before running it.
+        env.disable_gas_allowance_check = true;
         // Without `validation` a call may spend its whole gas limit on execution after
         // Amsterdam, as `eth_call` may; with it, the EIP-8037 cap holds as for a real
         // transaction. geth: `if !sim.validate { msg.SkipExecutionGasCapCheck() }`.
