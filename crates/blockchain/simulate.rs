@@ -1031,6 +1031,25 @@ mod tests {
     }
 
     #[test]
+    fn explicit_gas_budget_is_floored_at_the_base_block_gas_limit() {
+        let base = base_header(1, 12); // 30M block gas limit
+        let mut budget = GasBudget::new(5_000_000, &base);
+        assert_eq!((budget.explicit, budget.default), (30_000_000, 5_000_000));
+        // Every call spends from both, so a call with explicit gas past the cap leaves
+        // nothing for the defaults.
+        budget.spend(6_000_000);
+        assert_eq!((budget.explicit, budget.default), (24_000_000, 0));
+
+        let above = GasBudget::new(50_000_000, &base);
+        assert_eq!((above.explicit, above.default), (50_000_000, 50_000_000));
+        let unbounded = GasBudget::new(0, &base);
+        assert_eq!(
+            (unbounded.explicit, unbounded.default),
+            (u64::MAX, u64::MAX)
+        );
+    }
+
+    #[test]
     fn amsterdam_execution_reservation_depends_on_validation() {
         let gas_limit = 25_000_000;
         let strict = BlockGasTally {
