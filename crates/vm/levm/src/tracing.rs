@@ -26,6 +26,10 @@ pub struct LevmCallTracer {
     /// Next block-absolute log index to assign (geth's `log.Index`). Seeded with the
     /// count of logs emitted by preceding txs in the block and bumped on each log.
     pub next_log_index: u64,
+    /// Nested calls and creations that ended in an error, reverts included. Counted
+    /// even while the tracer is inactive, since it records nothing else: gas estimation
+    /// reads it to tell a sufficient gas limit apart from one that starves an inner call.
+    pub failed_nested_calls: u64,
 }
 
 impl LevmCallTracer {
@@ -39,6 +43,7 @@ impl LevmCallTracer {
             with_log,
             active: true,
             next_log_index: log_index_base,
+            failed_nested_calls: 0,
         }
     }
 
@@ -115,6 +120,9 @@ impl LevmCallTracer {
         ctx_result: &ContextResult,
         is_top_call: bool,
     ) -> Result<(), InternalError> {
+        if !is_top_call && !ctx_result.is_success() {
+            self.failed_nested_calls = self.failed_nested_calls.saturating_add(1);
+        }
         if !self.active {
             return Ok(());
         }
@@ -179,6 +187,11 @@ impl LevmCallTracer {
         gas_used: u64,
         error: Option<String>,
     ) -> Result<(), InternalError> {
+        // A nested call or creation that fails before it runs (no funds for the value,
+        // depth or nonce limit, address collision). SELFDESTRUCT passes no error.
+        if error.is_some() {
+            self.failed_nested_calls = self.failed_nested_calls.saturating_add(1);
+        }
         if !self.active {
             return Ok(());
         }
