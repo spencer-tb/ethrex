@@ -18,6 +18,7 @@ use ethrex_common::{
     Address, H256, U256,
     constants::{
         EMPTY_KECCAK_HASH, GAS_PER_BLOB, POST_OSAKA_GAS_LIMIT_CAP, TX_MAX_GAS_LIMIT_AMSTERDAM,
+        TX_MAX_TOTAL_GAS_LIMIT_AMSTERDAM,
     },
     types::{
         AccessListEntry, BlockHash, BlockHeader, BlockNumber, ChainConfig, Fork,
@@ -694,16 +695,19 @@ impl RpcHandler for EstimateGasRequest {
         }
 
         // Prepare binary search, as geth does. The ceiling is the request's `gas` when it is
-        // at least a transaction's base cost, otherwise the block gas limit. It is lowered to
-        // the EIP-7825 cap from Osaka until Amsterdam, and never goes above the node's RPC gas
-        // cap, raised to the real block's gas limit so the search can reach any gas limit a
+        // at least `TRANSACTION_GAS` (on every fork), otherwise the block gas limit. It is
+        // lowered to the fork's per-transaction gas limit cap (EIP-7825 from Osaka, the
+        // EIP-8037 total cap from Amsterdam), and never goes above the node's RPC gas cap,
+        // raised to the real block's gas limit so the search can reach any gas limit a
         // transaction in the block can have. A request `gas` above the block gas limit is
         // not cut to it.
         let requested = transaction
             .gas
             .filter(|gas| *gas >= TRANSACTION_GAS)
             .unwrap_or(env_header.gas_limit);
-        let requested = if current_fork >= Fork::Osaka && current_fork < Fork::Amsterdam {
+        let requested = if current_fork >= Fork::Amsterdam {
+            requested.min(TX_MAX_TOTAL_GAS_LIMIT_AMSTERDAM)
+        } else if current_fork >= Fork::Osaka {
             requested.min(POST_OSAKA_GAS_LIMIT_CAP)
         } else {
             requested
@@ -2006,6 +2010,27 @@ mod simulation_gas_cap_tests {
         .await
         .unwrap();
         assert!(word(&estimate) > ENTRY_OVERHEAD, "estimate {estimate}");
+    }
+
+    /// From Amsterdam the `eth_estimateGas` ceiling is at most the EIP-8037 total gas cap
+    /// (2^32 - 1), as before it the EIP-7825 cap bounds it from Osaka: a request `gas` above
+    /// it is lowered, so with no RPC gas cap a call that needs far less still gets an
+    /// estimate.
+    #[tokio::test]
+    async fn estimate_gas_lowers_a_requested_gas_above_the_total_cap_after_amsterdam() {
+        let params = vec![
+            call_object(Some(UNBOUNDED_GAS)),
+            json!("latest"),
+            overrides(GAS_LEFT_CODE),
+        ];
+        let estimate = run(AMSTERDAM_GENESIS, 0, "eth_estimateGas", params)
+            .await
+            .unwrap();
+        let estimate = word(&estimate);
+        assert!(
+            (15_000..100_000).contains(&estimate),
+            "estimate {estimate} for a call that needs about 15,000"
+        );
     }
 
     /// The block gas limit the large creation below is estimated on.
