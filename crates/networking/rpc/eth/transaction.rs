@@ -1924,6 +1924,33 @@ mod simulation_gas_cap_tests {
         let output = run(OSAKA_GENESIS, CAP, "eth_call", params).await.unwrap();
         assert_eq!(word(&output), BLOCK_GAS_LIMIT - ENTRY_OVERHEAD);
     }
+
+    /// After Amsterdam `eth_call` lifts the EIP-8037 execution cap for the intrinsic cost
+    /// too: a call whose calldata floor alone is above 2^24 runs, while `eth_estimateGas`,
+    /// which keeps the transaction rule, refuses it.
+    #[tokio::test]
+    async fn eth_call_accepts_an_intrinsic_cost_above_the_execution_cap_after_amsterdam() {
+        // 270,000 non-zero bytes put the EIP-7976 calldata floor at 270,000 * 4 * 16 gas
+        // plus the base cost, above 2^24.
+        let mut object = call_object(Some("0x1312d00")); // 20,000,000
+        object["input"] = json!(format!("0x{}", "ff".repeat(270_000)));
+        let params = || vec![object.clone(), json!("latest"), overrides(GAS_LEFT_CODE)];
+
+        run(AMSTERDAM_GENESIS, DEFAULT_RPC_GAS_CAP, "eth_call", params())
+            .await
+            .expect("eth_call with an intrinsic cost above 2^24");
+        assert!(
+            run(
+                AMSTERDAM_GENESIS,
+                DEFAULT_RPC_GAS_CAP,
+                "eth_estimateGas",
+                params()
+            )
+            .await
+            .is_err(),
+            "no transaction can carry an intrinsic cost above 2^24"
+        );
+    }
 }
 
 #[cfg(test)]
