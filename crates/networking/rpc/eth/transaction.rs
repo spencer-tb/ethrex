@@ -682,8 +682,10 @@ impl RpcHandler for EstimateGasRequest {
                     storage.clone(),
                     blockchain.clone(),
                 );
-                if let Ok(ExecutionResult::Success { .. }) = result {
-                    return serde_json::to_value(format!("{TRANSACTION_GAS:#x}"))
+                // The gas the transfer used rather than `TRANSACTION_GAS`, as geth: from
+                // Amsterdam a transfer can cost less (EIP-2780).
+                if let Ok(ExecutionResult::Success { gas_used, .. }) = result {
+                    return serde_json::to_value(format!("{gas_used:#x}"))
                         .map_err(|error| RpcErr::Internal(error.to_string()));
                 }
             }
@@ -1560,6 +1562,29 @@ mod plain_transfer_short_circuit_tests {
         .await
         .unwrap();
         assert_eq!(result, Value::String(WITH_CALLDATA.to_string()));
+    }
+
+    /// From Amsterdam a transfer with no value costs the 12,000 base plus the 3,000 cold
+    /// access to the recipient (EIP-2780), so the short circuit answers with the gas the
+    /// transfer used rather than 21000.
+    #[tokio::test]
+    async fn a_transfer_after_amsterdam_short_circuits_to_the_gas_it_used() {
+        let genesis: &str = include_str!("../../../../fixtures/genesis/l1-bal.json");
+        let genesis: Genesis =
+            serde_json::from_str(genesis).expect("Fatal: test config is invalid");
+        let mut store =
+            Store::new("test-store", EngineType::InMemory).expect("Fail to create in-memory db");
+        store.add_initial_state(genesis).await.unwrap();
+        let context = default_context_with_storage(store).await;
+        let request: RpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_estimateGas",
+            "params": [{ "from": SENDER, "to": CODE_LESS_ACCOUNT }, "latest"],
+        }))
+        .unwrap();
+        let result = map_http_requests(&request, context.clone()).await.unwrap();
+        assert_eq!(result, Value::String("0x3a98".to_string()));
     }
 
     /// An empty call to a contract runs its fallback, which the short circuit must not
