@@ -173,13 +173,19 @@ impl RpcHandler for CallRequest {
             &chain_config,
             env_header,
         )?;
-        // Bounded by the node's RPC gas cap, whatever the request asks for.
+        // Bounded by the node's RPC gas cap, whatever the request asks for. An explicit
+        // `gas` above the cap may still reach the block gas limit, so a transaction that
+        // fits in the block can be called; without one the default stays bounded by the cap.
+        let gas_cap = match self.transaction.gas {
+            Some(_) => rpc_gas_cap_at_block(context.rpc_gas_cap, &header),
+            None => context.rpc_gas_cap,
+        };
         let mut transaction = self.transaction.clone();
         transaction.gas = Some(simulation_gas_limit(
             transaction.gas,
             env_header,
             chain_config.fork(env_header.timestamp),
-            context.rpc_gas_cap,
+            gas_cap,
         ));
         // Nothing an `eth_call` runs is ever submitted, so after Amsterdam it may spend its
         // whole gas limit on execution, as geth lets it (the EIP-8037 execution cap is lifted).
@@ -685,11 +691,12 @@ impl RpcHandler for EstimateGasRequest {
 
         // Prepare binary search. The ceiling is the fork's per-transaction allowance for the
         // block, lowered to the request's `gas` when given, and never above the node's RPC
-        // gas cap.
+        // gas cap. The cap is raised to the real block's gas limit, so the search can reach
+        // any gas limit a transaction in the block can have.
         let allowance = get_max_allowed_gas_limit(env_header.gas_limit, current_fork);
         let mut highest_gas_limit = cap_simulation_gas(
             transaction.gas.map_or(allowance, |gas| gas.min(allowance)),
-            context.rpc_gas_cap,
+            rpc_gas_cap_at_block(context.rpc_gas_cap, &block_header),
         );
 
         // The cap has to be computed against the same fee the balance check will be
@@ -900,6 +907,19 @@ async fn recap_with_account_balances(
     // If account_gas exceeds u64, the account can afford any gas limit.
     let account_gas = u64::try_from(account_gas).unwrap_or(highest_gas_limit);
     Ok(highest_gas_limit.min(account_gas))
+}
+
+/// The node's RPC gas cap at the block of `header`, raised to that block's gas limit: a
+/// transaction that fits in the block can be included, so the RPCs that execute calls must
+/// not cap it below that. `header` must be the block's own header, never one with a Block
+/// Override Set applied, so that a request cannot lift the cap by overriding the gas
+/// limit. `0` stays `0`, no cap.
+pub(crate) fn rpc_gas_cap_at_block(rpc_gas_cap: u64, header: &BlockHeader) -> u64 {
+    if rpc_gas_cap == 0 {
+        0
+    } else {
+        rpc_gas_cap.max(header.gas_limit)
+    }
 }
 
 /// `gas` lowered to the node's RPC gas cap (`--rpc.gascap`); `0` means no cap.
@@ -1602,6 +1622,13 @@ mod simulation_gas_cap_tests {
         store
     }
 
+    /// `genesis` with its block gas limit set to `gas_limit`.
+    fn with_block_gas_limit(genesis: &str, gas_limit: u64) -> String {
+        let mut genesis: Value = serde_json::from_str(genesis).expect("test genesis is invalid");
+        genesis["gasLimit"] = json!(format!("{gas_limit:#x}"));
+        genesis.to_string()
+    }
+
     fn call_object(gas: Option<&str>) -> Value {
         let mut object = json!({ "from": SENDER, "to": CONTRACT });
         if let Some(gas) = gas {
@@ -1639,8 +1666,9 @@ mod simulation_gas_cap_tests {
         u64::try_from(word).expect("fits a u64")
     }
 
-    /// `eth_call` runs with `min(gas, cap)`, so the gas it reports at entry is the cap
-    /// minus the intrinsic cost however much the request asks for.
+    /// `eth_call` runs with `min(gas, cap)` when the cap is above the block gas limit, so
+    /// the gas it reports at entry is the cap minus the intrinsic cost however much the
+    /// request asks for.
     #[tokio::test]
     async fn eth_call_runs_with_at_most_the_rpc_gas_cap() {
         let params = |gas| vec![call_object(gas), json!("latest"), overrides(GAS_LEFT_CODE)];
@@ -1655,17 +1683,8 @@ mod simulation_gas_cap_tests {
         .unwrap();
         assert_eq!(word(&output), DEFAULT_RPC_GAS_CAP - ENTRY_OVERHEAD);
 
-        let output = run(
-            OSAKA_GENESIS,
-            1_000_000,
-            "eth_call",
-            params(Some(UNBOUNDED_GAS)),
-        )
-        .await
-        .unwrap();
-        assert_eq!(word(&output), 1_000_000 - ENTRY_OVERHEAD);
-
-        // The default gas of a call object without `gas` is bounded too.
+        // The default gas of a call object without `gas` is bounded too, whatever the
+        // block gas limit.
         let output = run(OSAKA_GENESIS, 1_000_000, "eth_call", params(None))
             .await
             .unwrap();
@@ -1684,8 +1703,9 @@ mod simulation_gas_cap_tests {
         assert_eq!(word(&output), 20_000_000 - ENTRY_OVERHEAD);
     }
 
-    /// The `eth_estimateGas` search ceiling is `min(gas, allowance, cap)`: a contract that
-    /// needs 10M gas is estimable under the default cap and unreachable under a 5M one.
+    /// The `eth_estimateGas` search ceiling is `min(gas, allowance, max(cap, block gas
+    /// limit))`: a contract that needs 10M gas is estimable under the default cap and
+    /// unreachable when both the cap (5M) and the block gas limit (8M) are below it.
     #[tokio::test]
     async fn estimate_gas_ceiling_is_bounded_by_the_rpc_gas_cap() {
         let params = || {
@@ -1710,12 +1730,17 @@ mod simulation_gas_cap_tests {
             "estimate {estimate} must cover the 10M the contract needs and stay within the Osaka allowance"
         );
 
-        let error = run(OSAKA_GENESIS, 5_000_000, "eth_estimateGas", params())
-            .await
-            .unwrap_err();
+        let error = run(
+            &with_block_gas_limit(OSAKA_GENESIS, 8_000_000),
+            5_000_000,
+            "eth_estimateGas",
+            params(),
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(error, RpcErr::Revert { .. }),
-            "with a 5M cap the contract can never get its 10M, got {error:?}"
+            "with a 5M cap and an 8M block the contract can never get its 10M, got {error:?}"
         );
     }
 
@@ -1814,6 +1839,65 @@ mod simulation_gas_cap_tests {
             result.get("error").is_some(),
             "the capped run must revert: {result}"
         );
+    }
+
+    /// The RPC gas cap never limits an explicit `gas` below the block gas limit, since a
+    /// transaction that fits in the block can be included. A call object without `gas`
+    /// keeps the cap as its default, the `eth_estimateGas` search reaches past the cap,
+    /// and a Block Override Set cannot lift the limit.
+    #[tokio::test]
+    async fn the_rpc_gas_cap_is_never_below_the_block_gas_limit() {
+        const CAP: u64 = 5_000_000;
+        const BLOCK_GAS_LIMIT: u64 = 25_000_000;
+
+        // 20M of explicit gas reaches a contract that needs 10M.
+        let params = vec![
+            call_object(Some("0x1312d00")), // 20,000,000
+            json!("latest"),
+            overrides(NEEDS_10M_CODE),
+        ];
+        run(OSAKA_GENESIS, CAP, "eth_call", params)
+            .await
+            .expect("eth_call with an explicit gas above the cap");
+
+        // An explicit gas above the block gas limit runs with the block gas limit.
+        let params = vec![
+            call_object(Some(UNBOUNDED_GAS)),
+            json!("latest"),
+            overrides(GAS_LEFT_CODE),
+        ];
+        let output = run(OSAKA_GENESIS, CAP, "eth_call", params).await.unwrap();
+        assert_eq!(word(&output), BLOCK_GAS_LIMIT - ENTRY_OVERHEAD);
+
+        // Without `gas`, the default stays the cap.
+        let params = vec![call_object(None), json!("latest"), overrides(GAS_LEFT_CODE)];
+        let output = run(OSAKA_GENESIS, CAP, "eth_call", params).await.unwrap();
+        assert_eq!(word(&output), CAP - ENTRY_OVERHEAD);
+
+        // The estimate's search reaches past the cap.
+        let params = vec![
+            call_object(None),
+            json!("latest"),
+            overrides(NEEDS_10M_CODE),
+        ];
+        let estimate = run(OSAKA_GENESIS, CAP, "eth_estimateGas", params)
+            .await
+            .unwrap();
+        let estimate = word(&estimate);
+        assert!(
+            (10_000_000 + ENTRY_OVERHEAD..=16_777_216).contains(&estimate),
+            "estimate {estimate} must cover the 10M the contract needs and stay within the Osaka allowance"
+        );
+
+        // A larger gas limit set through a Block Override Set does not lift the cap.
+        let params = vec![
+            call_object(Some("0x3b9aca00")), // 1,000,000,000
+            json!("latest"),
+            overrides(GAS_LEFT_CODE),
+            json!({ "gasLimit": "0x3b9aca00" }),
+        ];
+        let output = run(OSAKA_GENESIS, CAP, "eth_call", params).await.unwrap();
+        assert_eq!(word(&output), BLOCK_GAS_LIMIT - ENTRY_OVERHEAD);
     }
 }
 

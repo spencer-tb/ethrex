@@ -295,7 +295,10 @@ pub struct RpcApiContext {
     /// `eth_createAccessList`, `debug_traceCall`): a call runs with at most this much gas,
     /// whatever the request asks for. The memory a call can buy (operand padding, memory
     /// expansion) grows with its gas, so without a cap a request asking for 2^64 gas can
-    /// make the node attempt an allocation it cannot satisfy. `0` disables the cap.
+    /// make the node attempt an allocation it cannot satisfy. `0` disables the cap. The one
+    /// exception is the block gas limit, which a transaction may use: an `eth_call` or
+    /// `eth_simulateV1` call that sets its `gas`, and the `eth_estimateGas` search, are
+    /// never capped below it.
     pub rpc_gas_cap: u64,
     /// Channel for sending blocks to the block executor worker thread.
     pub block_worker_channel: BlockWorkerChannel,

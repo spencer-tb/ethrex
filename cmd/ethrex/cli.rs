@@ -364,7 +364,7 @@ pub struct Options {
         default_value_t = ethrex_rpc::DEFAULT_RPC_GAS_CAP,
         value_name = "GAS",
         help = "Gas cap for eth_call, eth_estimateGas, eth_createAccessList and debug_traceCall. 0 disables the cap.",
-        long_help = "Upper bound on the gas a simulation RPC (eth_call, eth_estimateGas, eth_createAccessList, debug_traceCall) runs with, whatever the request asks for. The memory a call can use grows with its gas, so the cap bounds what one request can make the node allocate. 0 disables the cap.",
+        long_help = "Upper bound on the gas a simulation RPC (eth_call, eth_estimateGas, eth_createAccessList, debug_traceCall) runs with. A gas that an eth_call or eth_simulateV1 call sets, and the eth_estimateGas search, are never capped below the block gas limit. The memory a call can use grows with its gas, so the cap bounds what one request can make the node allocate. 0 disables the cap.",
         help_heading = "RPC options",
         env = "ETHREX_RPC_GAS_CAP"
     )]

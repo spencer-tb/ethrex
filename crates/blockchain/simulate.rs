@@ -83,8 +83,44 @@ pub struct SimulationRequest {
     pub validation: bool,
     pub trace_transfers: bool,
     /// Cumulative gas allowance across all simulated blocks: the node's RPC gas
-    /// cap (`--rpc.gascap`), as geth's `RPCGasCap()`. `0` means no cap.
+    /// cap (`--rpc.gascap`), as geth's `RPCGasCap()`. `0` means no cap. Calls with
+    /// an explicit `gas` may go past it, up to the base block's gas limit (see
+    /// `GasBudget`).
     pub gas_cap: u64,
+}
+
+/// What is left of the request-wide gas allowance. Every executed call spends from both
+/// halves.
+///
+/// A call with an explicit `gas` draws on `explicit`, the RPC gas cap raised to the base
+/// block's gas limit, so a transaction that fits in a block can be simulated. The base
+/// block is the real one: a `gasLimit` block override cannot lift the cap. A call that
+/// omits `gas` gets its default from `default`, the plain cap, so its gas and what happens
+/// when the allowance runs out stay as they were.
+#[derive(Clone, Copy, Debug)]
+struct GasBudget {
+    explicit: u64,
+    default: u64,
+}
+
+impl GasBudget {
+    fn new(gas_cap: u64, base: &BlockHeader) -> Self {
+        if gas_cap == 0 {
+            return Self {
+                explicit: u64::MAX,
+                default: u64::MAX,
+            };
+        }
+        Self {
+            explicit: gas_cap.max(base.gas_limit),
+            default: gas_cap,
+        }
+    }
+
+    fn spend(&mut self, gas: u64) {
+        self.explicit = self.explicit.saturating_sub(gas);
+        self.default = self.default.saturating_sub(gas);
+    }
 }
 
 /// One simulated block plus its per-call results. `calls` and `senders` are
@@ -424,7 +460,7 @@ fn build_sim_transaction(
     chain_id: u64,
     fork: Fork,
     gas_tally: &BlockGasTally,
-    budget_remaining: u64,
+    budget: &GasBudget,
     evm: &mut ethrex_vm::Evm,
 ) -> Result<(Transaction, Address, bool), SimulationError> {
     if let Some(call_chain_id) = call.chain_id
@@ -455,11 +491,11 @@ fn build_sim_transaction(
                     remaining: remaining_block_gas,
                 });
             }
-            (gas.min(budget_remaining), gas > budget_remaining)
+            (gas.min(budget.explicit), gas > budget.explicit)
         }
         None => {
             let auto = remaining_block_gas.min(get_max_allowed_gas_limit(header.gas_limit, fork));
-            (auto.min(budget_remaining), auto > budget_remaining)
+            (auto.min(budget.default), auto > budget.default)
         }
     };
 
@@ -573,11 +609,7 @@ impl Blockchain {
         // `Arc::make_mut` then pays for at most one copy per block, and only while a
         // database built from the previous contents is still alive.
         let mut overlay = Arc::new(SimulationOverlay::new(base.number));
-        let mut budget_remaining = if request.gas_cap == 0 {
-            u64::MAX
-        } else {
-            request.gas_cap
-        };
+        let mut budget = GasBudget::new(request.gas_cap, &base);
         let mut parent = base;
         let mut results = Vec::with_capacity(blocks.len());
 
@@ -652,7 +684,7 @@ impl Blockchain {
                     chain_config.chain_id,
                     fork,
                     &gas_tally,
-                    budget_remaining,
+                    &budget,
                     &mut evm,
                 )?;
                 let report = match evm.execute_tx_simulate(
@@ -672,7 +704,7 @@ impl Blockchain {
                 };
 
                 gas_tally.add(report.gas_used, report.state_gas_used);
-                budget_remaining = budget_remaining.saturating_sub(report.gas_used);
+                budget.spend(report.gas_used);
                 blob_gas_used += (tx.blob_versioned_hashes().len() * GAS_PER_BLOB as usize) as u64;
 
                 // Trace-transfer logs go to the per-call results but must stay
