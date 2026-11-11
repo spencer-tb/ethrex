@@ -48,6 +48,8 @@ pub const ESTIMATE_ERROR_RATIO: f64 = 0.015;
 
 pub const CALL_STIPEND: u64 = 2_300; // Free gas given at beginning of call.
 pub const TRANSACTION_GAS: u64 = 21_000; // Per transaction not creating a contract. NOTE: Not payable on data of calls between transactions.
+/// The least a transaction costs from Amsterdam: its base cost under EIP-2780.
+const TX_BASE_COST_AMSTERDAM: u64 = 12_000;
 
 #[derive(Default)]
 pub struct CallRequest {
@@ -652,6 +654,16 @@ impl RpcHandler for EstimateGasRequest {
             }
         };
 
+        // A request `gas` bounds the estimate when it is at least the fork's minimum
+        // transaction cost, as geth: 21000, or the EIP-2780 base cost from Amsterdam. Below
+        // that it counts as not set.
+        let min_tx_cost = if current_fork >= Fork::Amsterdam {
+            TX_BASE_COST_AMSTERDAM
+        } else {
+            TRANSACTION_GAS
+        };
+        let requested_gas = transaction.gas.filter(|gas| *gas >= min_tx_cost);
+
         // If the transaction is a plain value transfer, short circuit estimation.
         //
         // A transfer is a call carrying no calldata to a recipient with no code, which is
@@ -677,8 +689,10 @@ impl RpcHandler for EstimateGasRequest {
             // empty.
             let has_code = account_info.is_some_and(|info| info.code_hash != *EMPTY_KECCAK_HASH);
             if !has_code {
+                // Run at the request's `gas` when it is lower, so the answer never exceeds it.
                 let mut value_transfer_transaction = transaction.clone();
-                value_transfer_transaction.gas = Some(TRANSACTION_GAS);
+                value_transfer_transaction.gas =
+                    Some(requested_gas.map_or(TRANSACTION_GAS, |gas| gas.min(TRANSACTION_GAS)));
                 let result: Result<ExecutionResult, RpcErr> = simulate_tx(
                     &value_transfer_transaction,
                     &block_header,
@@ -695,16 +709,13 @@ impl RpcHandler for EstimateGasRequest {
         }
 
         // Prepare binary search, as geth does. The ceiling is the request's `gas` when it is
-        // at least `TRANSACTION_GAS` (on every fork), otherwise the block gas limit. It is
+        // at least the fork's minimum transaction cost, otherwise the block gas limit. It is
         // lowered to the fork's per-transaction gas limit cap (EIP-7825 from Osaka, the
         // EIP-8037 total cap from Amsterdam), and never goes above the node's RPC gas cap,
         // raised to the real block's gas limit so the search can reach any gas limit a
         // transaction in the block can have. A request `gas` above the block gas limit is
         // not cut to it.
-        let requested = transaction
-            .gas
-            .filter(|gas| *gas >= TRANSACTION_GAS)
-            .unwrap_or(env_header.gas_limit);
+        let requested = requested_gas.unwrap_or(env_header.gas_limit);
         let requested = if current_fork >= Fork::Amsterdam {
             requested.min(TX_MAX_TOTAL_GAS_LIMIT_AMSTERDAM)
         } else if current_fork >= Fork::Osaka {
@@ -1589,11 +1600,7 @@ mod plain_transfer_short_circuit_tests {
         assert_eq!(result, Value::String(WITH_CALLDATA.to_string()));
     }
 
-    /// From Amsterdam a transfer with no value costs the 12,000 base plus the 3,000 cold
-    /// access to the recipient (EIP-2780), so the short circuit answers with the gas the
-    /// transfer used rather than 21000.
-    #[tokio::test]
-    async fn a_transfer_after_amsterdam_short_circuits_to_the_gas_it_used() {
+    async fn estimate_after_amsterdam(call_object: Value) -> Result<Value, crate::utils::RpcErr> {
         let genesis: &str = include_str!("../../../../fixtures/genesis/l1-bal.json");
         let genesis: Genesis =
             serde_json::from_str(genesis).expect("Fatal: test config is invalid");
@@ -1605,10 +1612,51 @@ mod plain_transfer_short_circuit_tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "eth_estimateGas",
-            "params": [{ "from": SENDER, "to": CODE_LESS_ACCOUNT }, "latest"],
+            "params": [call_object, "latest"],
         }))
         .unwrap();
-        let result = map_http_requests(&request, context.clone()).await.unwrap();
+        map_http_requests(&request, context.clone()).await
+    }
+
+    /// From Amsterdam a transfer with no value costs the 12,000 base plus the 3,000 cold
+    /// access to the recipient (EIP-2780), so the short circuit answers with the gas the
+    /// transfer used rather than 21000.
+    #[tokio::test]
+    async fn a_transfer_after_amsterdam_short_circuits_to_the_gas_it_used() {
+        let result = estimate_after_amsterdam(json!({ "from": SENDER, "to": CODE_LESS_ACCOUNT }))
+            .await
+            .unwrap();
+        assert_eq!(result, Value::String("0x3a98".to_string()));
+    }
+
+    /// From Amsterdam a request `gas` bounds the estimate from the EIP-2780 base cost of
+    /// 12,000, as geth. A 14,000 request for a transfer that costs 15,000 is too little, so
+    /// the estimate fails, and the short circuit must not answer above the request.
+    #[tokio::test]
+    async fn a_request_gas_from_the_base_cost_bounds_the_estimate_after_amsterdam() {
+        let result = estimate_after_amsterdam(json!({
+            "from": SENDER,
+            "to": CODE_LESS_ACCOUNT,
+            "gas": "0x36b0", // 14,000
+        }))
+        .await;
+        assert!(
+            result.is_err(),
+            "a 15,000 transfer cannot fit a 14,000 request, got {result:?}"
+        );
+    }
+
+    /// A request `gas` below the EIP-2780 base cost still counts as not set after Amsterdam,
+    /// so the estimate searches from the block gas limit.
+    #[tokio::test]
+    async fn a_request_gas_below_the_base_cost_is_ignored_after_amsterdam() {
+        let result = estimate_after_amsterdam(json!({
+            "from": SENDER,
+            "to": CODE_LESS_ACCOUNT,
+            "gas": "0x2af8", // 11,000
+        }))
+        .await
+        .unwrap();
         assert_eq!(result, Value::String("0x3a98".to_string()));
     }
 
