@@ -710,7 +710,9 @@ impl RpcHandler for EstimateGasRequest {
         } else if current_fork >= Fork::Osaka {
             requested.min(POST_OSAKA_GAS_LIMIT_CAP)
         } else {
-            requested
+            // No protocol cap before Osaka, but levm keeps a frame's gas in an `i64`, so a
+            // larger ceiling would wrap. No transaction needs that much gas.
+            requested.min(i64::MAX.unsigned_abs())
         };
         let mut highest_gas_limit = cap_simulation_gas(
             requested,
@@ -1677,6 +1679,16 @@ mod simulation_gas_cap_tests {
         genesis.to_string()
     }
 
+    /// `genesis` with Osaka never activated, so it runs Prague.
+    fn before_osaka(genesis: &str) -> String {
+        let mut genesis: Value = serde_json::from_str(genesis).expect("test genesis is invalid");
+        genesis["config"]
+            .as_object_mut()
+            .expect("genesis config")
+            .remove("osakaTime");
+        genesis.to_string()
+    }
+
     fn call_object(gas: Option<&str>) -> Value {
         let mut object = json!({ "from": SENDER, "to": CONTRACT });
         if let Some(gas) = gas {
@@ -2030,6 +2042,26 @@ mod simulation_gas_cap_tests {
         assert!(
             (15_000..100_000).contains(&estimate),
             "estimate {estimate} for a call that needs about 15,000"
+        );
+    }
+
+    /// Before Osaka no protocol cap bounds the `eth_estimateGas` ceiling, so it is lowered to
+    /// what levm can hold in a frame's `i64` gas: with no RPC gas cap a request `gas` of
+    /// 2^64 - 1 still gets an estimate for a call that needs far less.
+    #[tokio::test]
+    async fn estimate_gas_ceiling_fits_the_vm_before_osaka() {
+        let params = vec![
+            call_object(Some(UNBOUNDED_GAS)),
+            json!("latest"),
+            overrides(GAS_LEFT_CODE),
+        ];
+        let estimate = run(&before_osaka(OSAKA_GENESIS), 0, "eth_estimateGas", params)
+            .await
+            .unwrap();
+        let estimate = word(&estimate);
+        assert!(
+            (21_000..100_000).contains(&estimate),
+            "estimate {estimate} for a call that needs about 21,000"
         );
     }
 
