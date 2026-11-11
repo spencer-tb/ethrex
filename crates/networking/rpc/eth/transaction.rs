@@ -1925,6 +1925,34 @@ mod simulation_gas_cap_tests {
         assert_eq!(word(&output), BLOCK_GAS_LIMIT - ENTRY_OVERHEAD);
     }
 
+    /// A creation that deploys two maximum-size contracts needs more gas than the default
+    /// RPC gas cap (50M) but less than a 200M block gas limit: after Amsterdam most of it
+    /// is the code's state gas, which only the reservoir above 2^24 can pay. The estimate
+    /// lands between the two, as the execution-apis `estimate-above-rpc-cap` test checks.
+    #[tokio::test]
+    async fn estimate_gas_reaches_past_the_rpc_gas_cap_for_a_large_creation() {
+        const BLOCK_GAS_LIMIT: u64 = 200_000_000;
+        // Twice: CREATE a contract whose init code returns 0x6000 zero bytes, then POP.
+        let call = json!({
+            "from": SENDER,
+            "to": null,
+            "input": "0x656160006000f36000526006601a6000f0506006601a6000f05000",
+        });
+        let estimate = run(
+            &with_block_gas_limit(AMSTERDAM_GENESIS, BLOCK_GAS_LIMIT),
+            DEFAULT_RPC_GAS_CAP,
+            "eth_estimateGas",
+            vec![call, json!("latest")],
+        )
+        .await
+        .unwrap();
+        let estimate = word(&estimate);
+        assert!(
+            (DEFAULT_RPC_GAS_CAP + 1..=BLOCK_GAS_LIMIT).contains(&estimate),
+            "estimate {estimate} must be above the cap and at most the block gas limit"
+        );
+    }
+
     /// After Amsterdam `eth_call` lifts the EIP-8037 execution cap for the intrinsic cost
     /// too: a call whose calldata floor alone is above 2^24 runs, while `eth_estimateGas`,
     /// which keeps the transaction rule, refuses it.
