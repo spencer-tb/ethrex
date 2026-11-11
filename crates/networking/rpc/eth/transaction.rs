@@ -16,7 +16,9 @@ use ethrex_blockchain::{
 };
 use ethrex_common::{
     Address, H256, U256,
-    constants::{EMPTY_KECCAK_HASH, GAS_PER_BLOB, TX_MAX_GAS_LIMIT_AMSTERDAM},
+    constants::{
+        EMPTY_KECCAK_HASH, GAS_PER_BLOB, POST_OSAKA_GAS_LIMIT_CAP, TX_MAX_GAS_LIMIT_AMSTERDAM,
+    },
     types::{
         AccessListEntry, BlockHash, BlockHeader, BlockNumber, ChainConfig, Fork,
         GenericTransaction, TxKind,
@@ -691,13 +693,23 @@ impl RpcHandler for EstimateGasRequest {
             }
         }
 
-        // Prepare binary search. The ceiling is the fork's per-transaction allowance for the
-        // block, lowered to the request's `gas` when given, and never above the node's RPC
-        // gas cap. The cap is raised to the real block's gas limit, so the search can reach
-        // any gas limit a transaction in the block can have.
-        let allowance = get_max_allowed_gas_limit(env_header.gas_limit, current_fork);
+        // Prepare binary search, as geth does. The ceiling is the request's `gas` when it is
+        // at least a transaction's base cost, otherwise the block gas limit. It is lowered to
+        // the EIP-7825 cap from Osaka until Amsterdam, and never goes above the node's RPC gas
+        // cap, raised to the real block's gas limit so the search can reach any gas limit a
+        // transaction in the block can have. A request `gas` above the block gas limit is
+        // not cut to it.
+        let requested = transaction
+            .gas
+            .filter(|gas| *gas >= TRANSACTION_GAS)
+            .unwrap_or(env_header.gas_limit);
+        let requested = if current_fork >= Fork::Osaka && current_fork < Fork::Amsterdam {
+            requested.min(POST_OSAKA_GAS_LIMIT_CAP)
+        } else {
+            requested
+        };
         let mut highest_gas_limit = cap_simulation_gas(
-            transaction.gas.map_or(allowance, |gas| gas.min(allowance)),
+            requested,
             rpc_gas_cap_at_block(context.rpc_gas_cap, &block_header),
         );
 
@@ -1930,6 +1942,70 @@ mod simulation_gas_cap_tests {
         ];
         let output = run(OSAKA_GENESIS, CAP, "eth_call", params).await.unwrap();
         assert_eq!(word(&output), BLOCK_GAS_LIMIT - ENTRY_OVERHEAD);
+    }
+
+    /// The `eth_estimateGas` ceiling is the request's `gas` even above the block gas limit,
+    /// as geth. A creation that deploys 24,576 bytes needs more state gas than a 25M block
+    /// holds after Amsterdam: with 40M of explicit gas the estimate finds it, while without
+    /// `gas` the ceiling is the block gas limit and the estimate fails.
+    #[tokio::test]
+    async fn estimate_gas_keeps_a_requested_gas_above_the_block_gas_limit() {
+        const BLOCK_GAS_LIMIT: u64 = 25_000_000;
+        const REQUESTED: u64 = 40_000_000;
+        // `PUSH2 0x6000 PUSH1 0 RETURN`: deploys 24,576 zero bytes.
+        let creation = |gas: Option<&str>| {
+            let mut call = json!({ "from": SENDER, "to": null, "input": "0x6160006000f3" });
+            if let Some(gas) = gas {
+                call["gas"] = json!(gas);
+            }
+            vec![call, json!("latest")]
+        };
+
+        let estimate = run(
+            AMSTERDAM_GENESIS,
+            DEFAULT_RPC_GAS_CAP,
+            "eth_estimateGas",
+            creation(Some("0x2625a00")), // 40,000,000
+        )
+        .await
+        .unwrap();
+        let estimate = word(&estimate);
+        assert!(
+            (BLOCK_GAS_LIMIT + 1..=REQUESTED).contains(&estimate),
+            "estimate {estimate} must be above the block gas limit and at most the requested gas"
+        );
+
+        let without_gas = run(
+            AMSTERDAM_GENESIS,
+            DEFAULT_RPC_GAS_CAP,
+            "eth_estimateGas",
+            creation(None),
+        )
+        .await;
+        assert!(
+            without_gas.is_err(),
+            "without gas the ceiling is the 25M block gas limit, got {without_gas:?}"
+        );
+    }
+
+    /// A request `gas` below a transaction's base cost of 21000 does not bound the
+    /// `eth_estimateGas` search, as geth: the ceiling is then the block gas limit.
+    #[tokio::test]
+    async fn estimate_gas_ignores_a_requested_gas_below_the_base_cost() {
+        let params = vec![
+            call_object(Some("0x5207")), // 20,999
+            json!("latest"),
+            overrides(GAS_LEFT_CODE),
+        ];
+        let estimate = run(
+            OSAKA_GENESIS,
+            DEFAULT_RPC_GAS_CAP,
+            "eth_estimateGas",
+            params,
+        )
+        .await
+        .unwrap();
+        assert!(word(&estimate) > ENTRY_OVERHEAD, "estimate {estimate}");
     }
 
     /// The block gas limit the large creation below is estimated on.
