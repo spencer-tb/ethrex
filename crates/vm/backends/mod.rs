@@ -366,6 +366,25 @@ impl Evm {
         )
     }
 
+    /// Like [`Evm::simulate_tx_from_generic`], also returning how many nested calls and
+    /// creations ended in an error, reverts included.
+    pub fn simulate_tx_from_generic_counting_failed_calls(
+        &mut self,
+        tx: &GenericTransaction,
+        header: &BlockHeader,
+        execution_gas_cap: ExecutionGasCap,
+    ) -> Result<(ExecutionResult, u64), EvmError> {
+        LEVM::simulate_tx_from_generic_counting_failed_calls(
+            tx,
+            header,
+            &mut self.db,
+            self.vm_type,
+            self.crypto.as_ref(),
+            self.stateless_validator.as_deref(),
+            execution_gas_cap,
+        )
+    }
+
     /// EIP-8141 mempool validation-prefix simulation (local peer policy).
     /// Wraps [`LEVM::simulate_frame_validation_prefix`].
     pub fn simulate_frame_validation_prefix(

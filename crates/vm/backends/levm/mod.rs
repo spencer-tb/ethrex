@@ -3577,6 +3577,11 @@ impl LEVM {
         // enforcement only applies with `validation: true`.
         env.disable_sender_eoa_check = true;
         env.disable_nonce_check = !validate;
+        // The per-transaction gas limit caps (EIP-7825, and the EIP-8037 total cap after
+        // Amsterdam) are skipped in both modes, as geth skips them for every simulated
+        // call. The block gas limit still holds: `simulate_v1` refuses a call that does not
+        // fit the block before running it.
+        env.disable_gas_allowance_check = true;
         // Without `validation` a call may spend its whole gas limit on execution after
         // Amsterdam, as `eth_call` may; with it, the EIP-8037 cap holds as for a real
         // transaction. geth: `if !sim.validate { msg.SkipExecutionGasCapCheck() }`.
@@ -3678,6 +3683,31 @@ impl LEVM {
         stateless_validator: Option<&dyn StatelessValidator>,
         execution_gas_cap: ExecutionGasCap,
     ) -> Result<ExecutionResult, EvmError> {
+        Self::simulate_tx_from_generic_counting_failed_calls(
+            tx,
+            block_header,
+            db,
+            vm_type,
+            crypto,
+            stateless_validator,
+            execution_gas_cap,
+        )
+        .map(|(result, _)| result)
+    }
+
+    /// Like [`LEVM::simulate_tx_from_generic`], also returning how many nested calls and
+    /// creations ended in an error, reverts included. `eth_estimateGas` reads it so that it
+    /// does not settle on a gas limit where an inner call runs out of gas and the caller
+    /// catches the failure.
+    pub fn simulate_tx_from_generic_counting_failed_calls(
+        tx: &GenericTransaction,
+        block_header: &BlockHeader,
+        db: &mut GeneralizedDatabase,
+        vm_type: VMType,
+        crypto: &dyn Crypto,
+        stateless_validator: Option<&dyn StatelessValidator>,
+        execution_gas_cap: ExecutionGasCap,
+    ) -> Result<(ExecutionResult, u64), EvmError> {
         // `env_from_generic` already relaxes the admission-only validations for every
         // simulation RPC, the gas allowance included. `block_gas_limit` keeps the block's
         // real value there: the GASLIMIT opcode reads it, so overwriting it would make
@@ -3690,9 +3720,8 @@ impl LEVM {
         let converted_tx = generic_tx_to_transaction(tx)?;
         let mut vm = vm_from_generic(&converted_tx, env, db, vm_type, crypto, stateless_validator)?;
 
-        vm.execute()
-            .map(|value| value.into())
-            .map_err(VMError::into)
+        let report = vm.execute().map_err(EvmError::from)?;
+        Ok((report.into(), vm.tracer.failed_nested_calls))
     }
 
     /// EIP-8141 mempool validation-prefix simulation (local peer policy, never

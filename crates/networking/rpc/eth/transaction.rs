@@ -16,7 +16,10 @@ use ethrex_blockchain::{
 };
 use ethrex_common::{
     Address, H256, U256,
-    constants::{EMPTY_KECCAK_HASH, GAS_PER_BLOB},
+    constants::{
+        EMPTY_KECCAK_HASH, GAS_PER_BLOB, POST_OSAKA_GAS_LIMIT_CAP, TX_MAX_GAS_LIMIT_AMSTERDAM,
+        TX_MAX_TOTAL_GAS_LIMIT_AMSTERDAM,
+    },
     types::{
         AccessListEntry, BlockHash, BlockHeader, BlockNumber, ChainConfig, Fork,
         GenericTransaction, TxKind,
@@ -45,6 +48,8 @@ pub const ESTIMATE_ERROR_RATIO: f64 = 0.015;
 
 pub const CALL_STIPEND: u64 = 2_300; // Free gas given at beginning of call.
 pub const TRANSACTION_GAS: u64 = 21_000; // Per transaction not creating a contract. NOTE: Not payable on data of calls between transactions.
+/// The least a transaction costs from Amsterdam: its base cost under EIP-2780.
+const TX_BASE_COST_AMSTERDAM: u64 = 12_000;
 
 #[derive(Default)]
 pub struct CallRequest {
@@ -173,13 +178,19 @@ impl RpcHandler for CallRequest {
             &chain_config,
             env_header,
         )?;
-        // Bounded by the node's RPC gas cap, whatever the request asks for.
+        // Bounded by the node's RPC gas cap, whatever the request asks for. An explicit
+        // `gas` above the cap may still reach the block gas limit, so a transaction that
+        // fits in the block can be called; without one the default stays bounded by the cap.
+        let gas_cap = match self.transaction.gas {
+            Some(_) => rpc_gas_cap_at_block(context.rpc_gas_cap, &header),
+            None => context.rpc_gas_cap,
+        };
         let mut transaction = self.transaction.clone();
         transaction.gas = Some(simulation_gas_limit(
             transaction.gas,
             env_header,
             chain_config.fork(env_header.timestamp),
-            context.rpc_gas_cap,
+            gas_cap,
         ));
         // Nothing an `eth_call` runs is ever submitted, so after Amsterdam it may spend its
         // whole gas limit on execution, as geth lets it (the EIP-8037 execution cap is lifted).
@@ -643,6 +654,16 @@ impl RpcHandler for EstimateGasRequest {
             }
         };
 
+        // A request `gas` bounds the estimate when it is at least the fork's minimum
+        // transaction cost, as geth: 21000, or the EIP-2780 base cost from Amsterdam. Below
+        // that it counts as not set.
+        let min_tx_cost = if current_fork >= Fork::Amsterdam {
+            TX_BASE_COST_AMSTERDAM
+        } else {
+            TRANSACTION_GAS
+        };
+        let requested_gas = transaction.gas.filter(|gas| *gas >= min_tx_cost);
+
         // If the transaction is a plain value transfer, short circuit estimation.
         //
         // A transfer is a call carrying no calldata to a recipient with no code, which is
@@ -668,28 +689,45 @@ impl RpcHandler for EstimateGasRequest {
             // empty.
             let has_code = account_info.is_some_and(|info| info.code_hash != *EMPTY_KECCAK_HASH);
             if !has_code {
+                // Run at the request's `gas` when it is lower, so the answer never exceeds it.
                 let mut value_transfer_transaction = transaction.clone();
-                value_transfer_transaction.gas = Some(TRANSACTION_GAS);
+                value_transfer_transaction.gas =
+                    Some(requested_gas.map_or(TRANSACTION_GAS, |gas| gas.min(TRANSACTION_GAS)));
                 let result: Result<ExecutionResult, RpcErr> = simulate_tx(
                     &value_transfer_transaction,
                     &block_header,
                     storage.clone(),
                     blockchain.clone(),
                 );
-                if let Ok(ExecutionResult::Success { .. }) = result {
-                    return serde_json::to_value(format!("{TRANSACTION_GAS:#x}"))
+                // The gas the transfer used rather than `TRANSACTION_GAS`, as geth: from
+                // Amsterdam a transfer can cost less (EIP-2780).
+                if let Ok(ExecutionResult::Success { gas_used, .. }) = result {
+                    return serde_json::to_value(format!("{gas_used:#x}"))
                         .map_err(|error| RpcErr::Internal(error.to_string()));
                 }
             }
         }
 
-        // Prepare binary search. The ceiling is the fork's per-transaction allowance for the
-        // block, lowered to the request's `gas` when given, and never above the node's RPC
-        // gas cap.
-        let allowance = get_max_allowed_gas_limit(env_header.gas_limit, current_fork);
+        // Prepare binary search, as geth does. The ceiling is the request's `gas` when it is
+        // at least the fork's minimum transaction cost, otherwise the block gas limit. It is
+        // lowered to the fork's per-transaction gas limit cap (EIP-7825 from Osaka, the
+        // EIP-8037 total cap from Amsterdam), and never goes above the node's RPC gas cap,
+        // raised to the real block's gas limit so the search can reach any gas limit a
+        // transaction in the block can have. A request `gas` above the block gas limit is
+        // not cut to it.
+        let requested = requested_gas.unwrap_or(env_header.gas_limit);
+        let requested = if current_fork >= Fork::Amsterdam {
+            requested.min(TX_MAX_TOTAL_GAS_LIMIT_AMSTERDAM)
+        } else if current_fork >= Fork::Osaka {
+            requested.min(POST_OSAKA_GAS_LIMIT_CAP)
+        } else {
+            // No protocol cap before Osaka, but levm keeps a frame's gas in an `i64`, so a
+            // larger ceiling would wrap. No transaction needs that much gas.
+            requested.min(i64::MAX.unsigned_abs())
+        };
         let mut highest_gas_limit = cap_simulation_gas(
-            transaction.gas.map_or(allowance, |gas| gas.min(allowance)),
-            context.rpc_gas_cap,
+            requested,
+            rpc_gas_cap_at_block(context.rpc_gas_cap, &block_header),
         );
 
         // The cap has to be computed against the same fee the balance check will be
@@ -718,18 +756,50 @@ impl RpcHandler for EstimateGasRequest {
         )
         .await?;
 
-        // Check whether the execution is possible
+        // Runs the transaction with `gas`, returning how many of its nested calls failed
+        // when it succeeds.
         let mut transaction = transaction.clone();
-        transaction.gas = Some(highest_gas_limit);
-        let result = simulate_tx_with_overrides(
-            &transaction,
-            &block_header,
-            effective_header.as_ref(),
-            storage.clone(),
-            blockchain.clone(),
-            state_overrides.as_ref(),
-            ExecutionGasCap::Enforced,
-        )?;
+        let mut run = |gas: u64| {
+            transaction.gas = Some(gas);
+            simulate_tx_counting_failed_calls(
+                &transaction,
+                &block_header,
+                effective_header.as_ref(),
+                storage.clone(),
+                blockchain.clone(),
+                state_overrides.as_ref(),
+                ExecutionGasCap::Enforced,
+            )
+        };
+
+        // Check whether the execution is possible
+        let (result, failed_calls) = run(highest_gas_limit)?;
+
+        // A gas limit only counts as sufficient if no more nested calls fail than in a
+        // reference execution. Otherwise the search can settle on a limit where an inner
+        // call runs out of gas, the caller catches the failure and the transaction
+        // succeeds while doing something else than intended.
+        //
+        // After Amsterdam, gas above the EIP-8037 execution cap only feeds the state gas
+        // reservoir. A call that completes an inner call only with a reservoir would
+        // otherwise be sized past the cap, so for limits up to the cap the execution at the
+        // cap is the reference when it succeeds. Above the cap the execution at the
+        // ceiling stays the reference, since there more gas still buys more reservoir: a
+        // deployment whose inner creations need it must get enough for all of them.
+        let failed_at_cap =
+            if current_fork >= Fork::Amsterdam && highest_gas_limit > TX_MAX_GAS_LIMIT_AMSTERDAM {
+                run(TX_MAX_GAS_LIMIT_AMSTERDAM)
+                    .ok()
+                    .map(|(_, failed)| failed)
+            } else {
+                None
+            };
+        let allowed_failed_calls = |gas: u64| match failed_at_cap {
+            Some(at_cap) if gas <= TX_MAX_GAS_LIMIT_AMSTERDAM => failed_calls.max(at_cap),
+            _ => failed_calls,
+        };
+        let mut sufficient =
+            |gas: u64| matches!(run(gas), Ok((_, failed)) if failed <= allowed_failed_calls(gas));
 
         let gas_used = result.gas_used();
         let gas_refunded = result.gas_refunded();
@@ -737,22 +807,14 @@ impl RpcHandler for EstimateGasRequest {
         // Most transactions execute identically at their own `gas_used` as they do with
         // the whole block's gas available, and nothing can succeed below what an
         // unconstrained run consumed — so if that one re-run succeeds it *is* the minimum,
-        // and the search can be skipped entirely. Two simulations, exact. Only gas-observing
-        // callers (an explicit `GAS` check, or a subcall needing 63/64 headroom the
-        // consumed total does not imply) fall through to the search below.
-        transaction.gas = Some(gas_used);
+        // and the search can be skipped entirely. Only gas-observing callers (an explicit
+        // `GAS` check, or a subcall needing 63/64 headroom the consumed total does not
+        // imply) fall through to the search below, and so does a caller that catches a
+        // nested call starved at this limit.
         // Carries the override sets, like the search below: without them this re-runs
         // against real state, where a `code` override's callee holds no code at all, and
         // then returns a limit at which the overridden call would revert.
-        if let Ok(ExecutionResult::Success { .. }) = simulate_tx_with_overrides(
-            &transaction,
-            &block_header,
-            effective_header.as_ref(),
-            storage.clone(),
-            blockchain.clone(),
-            state_overrides.as_ref(),
-            ExecutionGasCap::Enforced,
-        ) {
+        if sufficient(gas_used) {
             return serde_json::to_value(format!("{gas_used:#x}"))
                 .map_err(|error| RpcErr::Internal(error.to_string()));
         }
@@ -778,18 +840,7 @@ impl RpcHandler for EstimateGasRequest {
                 // Favor the low side, since most transactions don't need much higher gas limit than their gas used.
                 middle_gas_limit = lowest_gas_limit * 2;
             }
-            transaction.gas = Some(middle_gas_limit);
-
-            let result = simulate_tx_with_overrides(
-                &transaction,
-                &block_header,
-                effective_header.as_ref(),
-                storage.clone(),
-                blockchain.clone(),
-                state_overrides.as_ref(),
-                ExecutionGasCap::Enforced,
-            );
-            if let Ok(ExecutionResult::Success { .. }) = result {
+            if sufficient(middle_gas_limit) {
                 highest_gas_limit = middle_gas_limit;
             } else {
                 lowest_gas_limit = middle_gas_limit;
@@ -896,6 +947,19 @@ async fn recap_with_account_balances(
     Ok(highest_gas_limit.min(account_gas))
 }
 
+/// The node's RPC gas cap at the block of `header`, raised to that block's gas limit: a
+/// transaction that fits in the block can be included, so the RPCs that execute calls must
+/// not cap it below that. `header` must be the block's own header, never one with a Block
+/// Override Set applied, so that a request cannot lift the cap by overriding the gas
+/// limit. `0` stays `0`, no cap.
+pub(crate) fn rpc_gas_cap_at_block(rpc_gas_cap: u64, header: &BlockHeader) -> u64 {
+    if rpc_gas_cap == 0 {
+        0
+    } else {
+        rpc_gas_cap.max(header.gas_limit)
+    }
+}
+
 /// `gas` lowered to the node's RPC gas cap (`--rpc.gascap`); `0` means no cap.
 pub(crate) fn cap_simulation_gas(gas: u64, rpc_gas_cap: u64) -> u64 {
     if rpc_gas_cap == 0 {
@@ -969,6 +1033,29 @@ pub(crate) fn simulate_tx_with_overrides(
     state_overrides: Option<&Arc<BTreeMap<Address, StateOverride>>>,
     execution_gas_cap: ExecutionGasCap,
 ) -> Result<ExecutionResult, RpcErr> {
+    simulate_tx_counting_failed_calls(
+        transaction,
+        real_header,
+        effective_header,
+        storage,
+        blockchain,
+        state_overrides,
+        execution_gas_cap,
+    )
+    .map(|(result, _)| result)
+}
+
+/// [`simulate_tx_with_overrides`], also returning how many nested calls and creations of
+/// the successful transaction ended in an error, reverts included.
+fn simulate_tx_counting_failed_calls(
+    transaction: &GenericTransaction,
+    real_header: &BlockHeader,
+    effective_header: Option<&BlockHeader>,
+    storage: Store,
+    blockchain: Arc<Blockchain>,
+    state_overrides: Option<&Arc<BTreeMap<Address, StateOverride>>>,
+    execution_gas_cap: ExecutionGasCap,
+) -> Result<(ExecutionResult, u64), RpcErr> {
     let env_header = effective_header.unwrap_or(real_header);
 
     // Build the inner DB from the REAL header so state_root and block-hash
@@ -981,13 +1068,21 @@ pub(crate) fn simulate_tx_with_overrides(
     // keying it on the state overrides made the same request error or return zero
     // depending on whether an unrelated state override happened to be present.
     let state_overrides = state_overrides.filter(|o| !o.is_empty());
-    let raw_result = if state_overrides.is_some() || effective_header.is_some() {
+    let (raw_result, failed_calls) = if state_overrides.is_some() || effective_header.is_some() {
         let overrides = state_overrides.cloned().unwrap_or_default();
         let mut vm = blockchain.new_overlaid_evm(inner, overrides, real_header.number)?;
-        vm.simulate_tx_from_generic(transaction, env_header, execution_gas_cap)?
+        vm.simulate_tx_from_generic_counting_failed_calls(
+            transaction,
+            env_header,
+            execution_gas_cap,
+        )?
     } else {
         let mut vm = blockchain.new_evm(inner)?;
-        vm.simulate_tx_from_generic(transaction, env_header, execution_gas_cap)?
+        vm.simulate_tx_from_generic_counting_failed_calls(
+            transaction,
+            env_header,
+            execution_gas_cap,
+        )?
     };
 
     match raw_result {
@@ -998,7 +1093,7 @@ pub(crate) fn simulate_tx_with_overrides(
             data: format!("0x{output:#x}"),
         }),
         ExecutionResult::Halt { reason, gas_used } => Err(RpcErr::Halt { reason, gas_used }),
-        success => Ok(success),
+        success => Ok((success, failed_calls)),
     }
 }
 
@@ -1505,6 +1600,66 @@ mod plain_transfer_short_circuit_tests {
         assert_eq!(result, Value::String(WITH_CALLDATA.to_string()));
     }
 
+    async fn estimate_after_amsterdam(call_object: Value) -> Result<Value, crate::utils::RpcErr> {
+        let genesis: &str = include_str!("../../../../fixtures/genesis/l1-bal.json");
+        let genesis: Genesis =
+            serde_json::from_str(genesis).expect("Fatal: test config is invalid");
+        let mut store =
+            Store::new("test-store", EngineType::InMemory).expect("Fail to create in-memory db");
+        store.add_initial_state(genesis).await.unwrap();
+        let context = default_context_with_storage(store).await;
+        let request: RpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_estimateGas",
+            "params": [call_object, "latest"],
+        }))
+        .unwrap();
+        map_http_requests(&request, context.clone()).await
+    }
+
+    /// From Amsterdam a transfer with no value costs the 12,000 base plus the 3,000 cold
+    /// access to the recipient (EIP-2780), so the short circuit answers with the gas the
+    /// transfer used rather than 21000.
+    #[tokio::test]
+    async fn a_transfer_after_amsterdam_short_circuits_to_the_gas_it_used() {
+        let result = estimate_after_amsterdam(json!({ "from": SENDER, "to": CODE_LESS_ACCOUNT }))
+            .await
+            .unwrap();
+        assert_eq!(result, Value::String("0x3a98".to_string()));
+    }
+
+    /// From Amsterdam a request `gas` bounds the estimate from the EIP-2780 base cost of
+    /// 12,000, as geth. A 14,000 request for a transfer that costs 15,000 is too little, so
+    /// the estimate fails, and the short circuit must not answer above the request.
+    #[tokio::test]
+    async fn a_request_gas_from_the_base_cost_bounds_the_estimate_after_amsterdam() {
+        let result = estimate_after_amsterdam(json!({
+            "from": SENDER,
+            "to": CODE_LESS_ACCOUNT,
+            "gas": "0x36b0", // 14,000
+        }))
+        .await;
+        assert!(
+            result.is_err(),
+            "a 15,000 transfer cannot fit a 14,000 request, got {result:?}"
+        );
+    }
+
+    /// A request `gas` below the EIP-2780 base cost still counts as not set after Amsterdam,
+    /// so the estimate searches from the block gas limit.
+    #[tokio::test]
+    async fn a_request_gas_below_the_base_cost_is_ignored_after_amsterdam() {
+        let result = estimate_after_amsterdam(json!({
+            "from": SENDER,
+            "to": CODE_LESS_ACCOUNT,
+            "gas": "0x2af8", // 11,000
+        }))
+        .await
+        .unwrap();
+        assert_eq!(result, Value::String("0x3a98".to_string()));
+    }
+
     /// An empty call to a contract runs its fallback, which the short circuit must not
     /// price at 21000. The deposit contract from the l1 genesis reverts on an empty call,
     /// so the estimate is an error rather than a number.
@@ -1565,6 +1720,23 @@ mod simulation_gas_cap_tests {
         store
     }
 
+    /// `genesis` with its block gas limit set to `gas_limit`.
+    fn with_block_gas_limit(genesis: &str, gas_limit: u64) -> String {
+        let mut genesis: Value = serde_json::from_str(genesis).expect("test genesis is invalid");
+        genesis["gasLimit"] = json!(format!("{gas_limit:#x}"));
+        genesis.to_string()
+    }
+
+    /// `genesis` with Osaka never activated, so it runs Prague.
+    fn before_osaka(genesis: &str) -> String {
+        let mut genesis: Value = serde_json::from_str(genesis).expect("test genesis is invalid");
+        genesis["config"]
+            .as_object_mut()
+            .expect("genesis config")
+            .remove("osakaTime");
+        genesis.to_string()
+    }
+
     fn call_object(gas: Option<&str>) -> Value {
         let mut object = json!({ "from": SENDER, "to": CONTRACT });
         if let Some(gas) = gas {
@@ -1602,8 +1774,9 @@ mod simulation_gas_cap_tests {
         u64::try_from(word).expect("fits a u64")
     }
 
-    /// `eth_call` runs with `min(gas, cap)`, so the gas it reports at entry is the cap
-    /// minus the intrinsic cost however much the request asks for.
+    /// `eth_call` runs with `min(gas, cap)` when the cap is above the block gas limit, so
+    /// the gas it reports at entry is the cap minus the intrinsic cost however much the
+    /// request asks for.
     #[tokio::test]
     async fn eth_call_runs_with_at_most_the_rpc_gas_cap() {
         let params = |gas| vec![call_object(gas), json!("latest"), overrides(GAS_LEFT_CODE)];
@@ -1618,17 +1791,8 @@ mod simulation_gas_cap_tests {
         .unwrap();
         assert_eq!(word(&output), DEFAULT_RPC_GAS_CAP - ENTRY_OVERHEAD);
 
-        let output = run(
-            OSAKA_GENESIS,
-            1_000_000,
-            "eth_call",
-            params(Some(UNBOUNDED_GAS)),
-        )
-        .await
-        .unwrap();
-        assert_eq!(word(&output), 1_000_000 - ENTRY_OVERHEAD);
-
-        // The default gas of a call object without `gas` is bounded too.
+        // The default gas of a call object without `gas` is bounded too, whatever the
+        // block gas limit.
         let output = run(OSAKA_GENESIS, 1_000_000, "eth_call", params(None))
             .await
             .unwrap();
@@ -1647,8 +1811,9 @@ mod simulation_gas_cap_tests {
         assert_eq!(word(&output), 20_000_000 - ENTRY_OVERHEAD);
     }
 
-    /// The `eth_estimateGas` search ceiling is `min(gas, allowance, cap)`: a contract that
-    /// needs 10M gas is estimable under the default cap and unreachable under a 5M one.
+    /// The `eth_estimateGas` search ceiling is `min(gas, allowance, max(cap, block gas
+    /// limit))`: a contract that needs 10M gas is estimable under the default cap and
+    /// unreachable when both the cap (5M) and the block gas limit (8M) are below it.
     #[tokio::test]
     async fn estimate_gas_ceiling_is_bounded_by_the_rpc_gas_cap() {
         let params = || {
@@ -1673,12 +1838,17 @@ mod simulation_gas_cap_tests {
             "estimate {estimate} must cover the 10M the contract needs and stay within the Osaka allowance"
         );
 
-        let error = run(OSAKA_GENESIS, 5_000_000, "eth_estimateGas", params())
-            .await
-            .unwrap_err();
+        let error = run(
+            &with_block_gas_limit(OSAKA_GENESIS, 8_000_000),
+            5_000_000,
+            "eth_estimateGas",
+            params(),
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(error, RpcErr::Revert { .. }),
-            "with a 5M cap the contract can never get its 10M, got {error:?}"
+            "with a 5M cap and an 8M block the contract can never get its 10M, got {error:?}"
         );
     }
 
@@ -1777,5 +1947,481 @@ mod simulation_gas_cap_tests {
             result.get("error").is_some(),
             "the capped run must revert: {result}"
         );
+    }
+
+    /// The RPC gas cap never limits an explicit `gas` below the block gas limit, since a
+    /// transaction that fits in the block can be included. A call object without `gas`
+    /// keeps the cap as its default, the `eth_estimateGas` search reaches past the cap,
+    /// and a Block Override Set cannot lift the limit.
+    #[tokio::test]
+    async fn the_rpc_gas_cap_is_never_below_the_block_gas_limit() {
+        const CAP: u64 = 5_000_000;
+        const BLOCK_GAS_LIMIT: u64 = 25_000_000;
+
+        // 20M of explicit gas reaches a contract that needs 10M.
+        let params = vec![
+            call_object(Some("0x1312d00")), // 20,000,000
+            json!("latest"),
+            overrides(NEEDS_10M_CODE),
+        ];
+        run(OSAKA_GENESIS, CAP, "eth_call", params)
+            .await
+            .expect("eth_call with an explicit gas above the cap");
+
+        // An explicit gas above the block gas limit runs with the block gas limit.
+        let params = vec![
+            call_object(Some(UNBOUNDED_GAS)),
+            json!("latest"),
+            overrides(GAS_LEFT_CODE),
+        ];
+        let output = run(OSAKA_GENESIS, CAP, "eth_call", params).await.unwrap();
+        assert_eq!(word(&output), BLOCK_GAS_LIMIT - ENTRY_OVERHEAD);
+
+        // Without `gas`, the default stays the cap.
+        let params = vec![call_object(None), json!("latest"), overrides(GAS_LEFT_CODE)];
+        let output = run(OSAKA_GENESIS, CAP, "eth_call", params).await.unwrap();
+        assert_eq!(word(&output), CAP - ENTRY_OVERHEAD);
+
+        // The estimate's search reaches past the cap.
+        let params = vec![
+            call_object(None),
+            json!("latest"),
+            overrides(NEEDS_10M_CODE),
+        ];
+        let estimate = run(OSAKA_GENESIS, CAP, "eth_estimateGas", params)
+            .await
+            .unwrap();
+        let estimate = word(&estimate);
+        assert!(
+            (10_000_000 + ENTRY_OVERHEAD..=16_777_216).contains(&estimate),
+            "estimate {estimate} must cover the 10M the contract needs and stay within the Osaka allowance"
+        );
+
+        // A larger gas limit set through a Block Override Set does not lift the cap.
+        let params = vec![
+            call_object(Some("0x3b9aca00")), // 1,000,000,000
+            json!("latest"),
+            overrides(GAS_LEFT_CODE),
+            json!({ "gasLimit": "0x3b9aca00" }),
+        ];
+        let output = run(OSAKA_GENESIS, CAP, "eth_call", params).await.unwrap();
+        assert_eq!(word(&output), BLOCK_GAS_LIMIT - ENTRY_OVERHEAD);
+    }
+
+    /// The `eth_estimateGas` ceiling is the request's `gas` even above the block gas limit,
+    /// as geth. A creation that deploys 24,576 bytes needs more state gas than a 25M block
+    /// holds after Amsterdam: with 40M of explicit gas the estimate finds it, while without
+    /// `gas` the ceiling is the block gas limit and the estimate fails.
+    #[tokio::test]
+    async fn estimate_gas_keeps_a_requested_gas_above_the_block_gas_limit() {
+        const BLOCK_GAS_LIMIT: u64 = 25_000_000;
+        const REQUESTED: u64 = 40_000_000;
+        // `PUSH2 0x6000 PUSH1 0 RETURN`: deploys 24,576 zero bytes.
+        let creation = |gas: Option<&str>| {
+            let mut call = json!({ "from": SENDER, "to": null, "input": "0x6160006000f3" });
+            if let Some(gas) = gas {
+                call["gas"] = json!(gas);
+            }
+            vec![call, json!("latest")]
+        };
+
+        let estimate = run(
+            AMSTERDAM_GENESIS,
+            DEFAULT_RPC_GAS_CAP,
+            "eth_estimateGas",
+            creation(Some("0x2625a00")), // 40,000,000
+        )
+        .await
+        .unwrap();
+        let estimate = word(&estimate);
+        assert!(
+            (BLOCK_GAS_LIMIT + 1..=REQUESTED).contains(&estimate),
+            "estimate {estimate} must be above the block gas limit and at most the requested gas"
+        );
+
+        let without_gas = run(
+            AMSTERDAM_GENESIS,
+            DEFAULT_RPC_GAS_CAP,
+            "eth_estimateGas",
+            creation(None),
+        )
+        .await;
+        assert!(
+            without_gas.is_err(),
+            "without gas the ceiling is the 25M block gas limit, got {without_gas:?}"
+        );
+    }
+
+    /// A request `gas` below a transaction's base cost of 21000 does not bound the
+    /// `eth_estimateGas` search, as geth: the ceiling is then the block gas limit.
+    #[tokio::test]
+    async fn estimate_gas_ignores_a_requested_gas_below_the_base_cost() {
+        let params = vec![
+            call_object(Some("0x5207")), // 20,999
+            json!("latest"),
+            overrides(GAS_LEFT_CODE),
+        ];
+        let estimate = run(
+            OSAKA_GENESIS,
+            DEFAULT_RPC_GAS_CAP,
+            "eth_estimateGas",
+            params,
+        )
+        .await
+        .unwrap();
+        assert!(word(&estimate) > ENTRY_OVERHEAD, "estimate {estimate}");
+    }
+
+    /// From Amsterdam the `eth_estimateGas` ceiling is at most the EIP-8037 total gas cap
+    /// (2^32 - 1), as before it the EIP-7825 cap bounds it from Osaka: a request `gas` above
+    /// it is lowered, so with no RPC gas cap a call that needs far less still gets an
+    /// estimate.
+    #[tokio::test]
+    async fn estimate_gas_lowers_a_requested_gas_above_the_total_cap_after_amsterdam() {
+        let params = vec![
+            call_object(Some(UNBOUNDED_GAS)),
+            json!("latest"),
+            overrides(GAS_LEFT_CODE),
+        ];
+        let estimate = run(AMSTERDAM_GENESIS, 0, "eth_estimateGas", params)
+            .await
+            .unwrap();
+        let estimate = word(&estimate);
+        assert!(
+            (15_000..100_000).contains(&estimate),
+            "estimate {estimate} for a call that needs about 15,000"
+        );
+    }
+
+    /// Before Osaka no protocol cap bounds the `eth_estimateGas` ceiling, so it is lowered to
+    /// what levm can hold in a frame's `i64` gas: with no RPC gas cap a request `gas` of
+    /// 2^64 - 1 still gets an estimate for a call that needs far less.
+    #[tokio::test]
+    async fn estimate_gas_ceiling_fits_the_vm_before_osaka() {
+        let params = vec![
+            call_object(Some(UNBOUNDED_GAS)),
+            json!("latest"),
+            overrides(GAS_LEFT_CODE),
+        ];
+        let estimate = run(&before_osaka(OSAKA_GENESIS), 0, "eth_estimateGas", params)
+            .await
+            .unwrap();
+        let estimate = word(&estimate);
+        assert!(
+            (21_000..100_000).contains(&estimate),
+            "estimate {estimate} for a call that needs about 21,000"
+        );
+    }
+
+    /// The block gas limit the large creation below is estimated on.
+    const LARGE_CREATION_BLOCK_GAS_LIMIT: u64 = 200_000_000;
+    /// Creates, twice, a contract whose init code returns 0x6000 zero bytes, and pops each
+    /// result: `PUSH6 <PUSH2 0x6000 PUSH1 0 RETURN> PUSH1 0 MSTORE`, then
+    /// `PUSH1 6 PUSH1 26 PUSH1 0 CREATE POP` twice, then `STOP`.
+    const LARGE_CREATION_CODE: &str = "0x656160006000f36000526006601a6000f0506006601a6000f05000";
+
+    async fn estimate_large_creation() -> u64 {
+        let call = json!({ "from": SENDER, "to": null, "input": LARGE_CREATION_CODE });
+        let estimate = run(
+            &with_block_gas_limit(AMSTERDAM_GENESIS, LARGE_CREATION_BLOCK_GAS_LIMIT),
+            DEFAULT_RPC_GAS_CAP,
+            "eth_estimateGas",
+            vec![call, json!("latest")],
+        )
+        .await
+        .unwrap();
+        word(&estimate)
+    }
+
+    /// A creation that deploys two maximum-size contracts needs more gas than the default
+    /// RPC gas cap (50M) but less than a 200M block gas limit: after Amsterdam most of it
+    /// is the code's state gas, which only the reservoir above 2^24 can pay. The estimate
+    /// lands between the two, as the execution-apis `estimate-above-rpc-cap` test checks.
+    #[tokio::test]
+    async fn estimate_gas_reaches_past_the_rpc_gas_cap_for_a_large_creation() {
+        let estimate = estimate_large_creation().await;
+        assert!(
+            (DEFAULT_RPC_GAS_CAP + 1..=LARGE_CREATION_BLOCK_GAS_LIMIT).contains(&estimate),
+            "estimate {estimate} must be above the cap and at most the block gas limit"
+        );
+    }
+
+    /// With no reservoir, both inner creations of the large creation fail at 2^24. Above
+    /// 2^24 that count must not be the reference, or the estimate settles where the second
+    /// creation is starved and the pop hides it. Run at the estimate as a validating
+    /// `eth_simulateV1` call, the creation must deploy both contracts.
+    #[tokio::test]
+    async fn a_large_creation_estimate_leaves_both_inner_creations_enough_gas() {
+        use ethrex_common::Address;
+        use ethrex_common::evm::calculate_create_address;
+
+        const CHECKER: &str = "0x000000000000000000000000000000000000c4ec";
+        const FEE: &str = "0x77359400"; // 2 gwei
+        let estimate = estimate_large_creation().await;
+
+        // The creation's own address, then the two contracts it creates with nonces 1 and 2.
+        let deployer = calculate_create_address(Address::from_str(SENDER).unwrap(), 0);
+        let child = |nonce| hex::encode(calculate_create_address(deployer, nonce).as_bytes());
+        // Returns the code sizes of both: `PUSH20 first EXTCODESIZE PUSH0 MSTORE
+        // PUSH20 second EXTCODESIZE PUSH1 0x20 MSTORE PUSH1 0x40 PUSH0 RETURN`.
+        let checker_code = format!("0x73{}3b5f5273{}3b60205260405ff3", child(1), child(2));
+        let params = vec![
+            json!({
+                "validation": true,
+                "blockStateCalls": [{
+                    "stateOverrides": { CHECKER: { "code": checker_code } },
+                    "calls": [
+                        {
+                            "from": SENDER,
+                            "input": LARGE_CREATION_CODE,
+                            "gas": format!("{estimate:#x}"),
+                            "nonce": "0x0",
+                            "maxFeePerGas": FEE,
+                        },
+                        {
+                            "from": SENDER,
+                            "to": CHECKER,
+                            "gas": "0x186a0",
+                            "nonce": "0x1",
+                            "maxFeePerGas": FEE,
+                        },
+                    ],
+                }],
+            }),
+            json!("latest"),
+        ];
+        let result = run(
+            &with_block_gas_limit(AMSTERDAM_GENESIS, LARGE_CREATION_BLOCK_GAS_LIMIT),
+            DEFAULT_RPC_GAS_CAP,
+            "eth_simulateV1",
+            params,
+        )
+        .await
+        .unwrap();
+        let calls = &result[0]["calls"];
+        assert_eq!(calls[0]["status"], "0x1", "{result}");
+        let sizes = calls[1]["returnData"].as_str().expect("hex return data");
+        let size = |word: &str| u64::from_str_radix(word, 16).unwrap();
+        assert_eq!(
+            (size(&sizes[2..66]), size(&sizes[66..130])),
+            (0x6000, 0x6000),
+            "an inner creation is starved at the estimate {estimate}: {result}"
+        );
+    }
+
+    /// After Amsterdam `eth_call` lifts the EIP-8037 execution cap for the intrinsic cost
+    /// too: a call whose calldata floor alone is above 2^24 runs, while `eth_estimateGas`,
+    /// which keeps the transaction rule, refuses it.
+    #[tokio::test]
+    async fn eth_call_accepts_an_intrinsic_cost_above_the_execution_cap_after_amsterdam() {
+        // 270,000 non-zero bytes put the EIP-7976 calldata floor at 270,000 * 4 * 16 gas
+        // plus the base cost, above 2^24.
+        let mut object = call_object(Some("0x1312d00")); // 20,000,000
+        object["input"] = json!(format!("0x{}", "ff".repeat(270_000)));
+        let params = || vec![object.clone(), json!("latest"), overrides(GAS_LEFT_CODE)];
+
+        run(AMSTERDAM_GENESIS, DEFAULT_RPC_GAS_CAP, "eth_call", params())
+            .await
+            .expect("eth_call with an intrinsic cost above 2^24");
+        assert!(
+            run(
+                AMSTERDAM_GENESIS,
+                DEFAULT_RPC_GAS_CAP,
+                "eth_estimateGas",
+                params()
+            )
+            .await
+            .is_err(),
+            "no transaction can carry an intrinsic cost above 2^24"
+        );
+    }
+}
+
+#[cfg(test)]
+mod estimate_gas_failed_nested_call_tests {
+    use std::str::FromStr;
+
+    use crate::rpc::map_http_requests;
+    use crate::test_utils::default_context_with_storage;
+    use crate::utils::{RpcErr, RpcRequest};
+    use ethrex_common::U256;
+    use ethrex_common::constants::TX_MAX_GAS_LIMIT_AMSTERDAM;
+    use ethrex_common::types::Genesis;
+    use ethrex_storage::{EngineType, Store};
+    use serde_json::{Value, json};
+
+    /// Osaka at genesis, 25M block gas limit.
+    const OSAKA_GENESIS: &str = include_str!("../../../../fixtures/genesis/l1.json");
+    /// Amsterdam at genesis, 25M block gas limit.
+    const AMSTERDAM_GENESIS: &str = include_str!("../../../../fixtures/genesis/l1-bal.json");
+    /// Funded EOA present in both genesis files.
+    const SENDER: &str = "0x00000a8d3f37af8def18832962ee008d8dca4f7b";
+    const BURNER: &str = "0x000000000000000000000000000000000000b001";
+    const STORER: &str = "0x000000000000000000000000000000000000b002";
+    const CALLER: &str = "0x000000000000000000000000000000000000ca01";
+    /// Loops 3000 times, about 78,000 gas:
+    /// `PUSH2 3000 JUMPDEST PUSH1 1 SWAP1 SUB DUP1 PUSH1 3 JUMPI STOP`.
+    const BURNER_CODE: &str = "0x610bb85b600190038060035700";
+    /// Sets a fresh storage slot: `PUSH1 1 PUSH1 0 SSTORE STOP`.
+    const STORER_CODE: &str = "0x600160005500";
+    /// `GAS`: the call forwards all the gas it can.
+    const ALL_GAS: &str = "5a";
+
+    /// Calls `callee` with the gas `gas_op` pushes and returns whether the call succeeded:
+    /// `PUSH1 0 (x5) PUSH20 callee <gas_op> CALL PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN`.
+    fn caller_code(callee: &str, gas_op: &str) -> String {
+        let callee = callee.trim_start_matches("0x");
+        format!("0x6000600060006000600073{callee}{gas_op}f160005260206000f3")
+    }
+
+    /// `CALLER` running `caller_code` against `callee` with `callee_code`.
+    fn caller_overrides(callee: &str, callee_code: &str, gas_op: &str) -> Value {
+        json!({
+            callee: { "code": callee_code },
+            CALLER: { "code": caller_code(callee, gas_op) },
+        })
+    }
+
+    async fn run(genesis: &str, method: &str, params: Vec<Value>) -> Result<Value, RpcErr> {
+        let genesis: Genesis = serde_json::from_str(genesis).expect("test genesis is invalid");
+        let mut store =
+            Store::new("test-store", EngineType::InMemory).expect("Fail to create in-memory db");
+        store.add_initial_state(genesis).await.unwrap();
+        let context = default_context_with_storage(store).await;
+        let request: RpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        }))
+        .unwrap();
+        map_http_requests(&request, context.clone()).await
+    }
+
+    async fn estimate(genesis: &str, overrides: &Value) -> u64 {
+        let call = json!({ "from": SENDER, "to": CALLER });
+        let estimate = run(
+            genesis,
+            "eth_estimateGas",
+            vec![call, json!("latest"), overrides.clone()],
+        )
+        .await
+        .unwrap();
+        word(&estimate)
+    }
+
+    fn word(value: &Value) -> u64 {
+        let word = U256::from_str(value.as_str().expect("hex string output")).unwrap();
+        u64::try_from(word).expect("fits a u64")
+    }
+
+    /// The caller gives the burner all its gas and catches the failure. At the gas the
+    /// unconstrained run used, the burner gets 63/64 of what it needs and runs out while
+    /// the transaction still succeeds, so the estimate must not settle there.
+    #[tokio::test]
+    async fn the_estimate_leaves_a_caught_nested_call_enough_gas() {
+        let overrides = caller_overrides(BURNER, BURNER_CODE, ALL_GAS);
+        let gas = estimate(OSAKA_GENESIS, &overrides).await;
+
+        let call = json!({ "from": SENDER, "to": CALLER, "gas": format!("{gas:#x}") });
+        let output = run(
+            OSAKA_GENESIS,
+            "eth_call",
+            vec![call, json!("latest"), overrides],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            word(&output),
+            1,
+            "the burner runs out of gas at the estimate {gas}"
+        );
+    }
+
+    /// A nested call that runs out of gas at every gas limit fails in the reference
+    /// execution too, so it does not push the estimate up.
+    #[tokio::test]
+    async fn a_nested_call_that_always_fails_does_not_inflate_the_estimate() {
+        // `PUSH2 1000`: the burner always runs out.
+        let overrides = caller_overrides(BURNER, BURNER_CODE, "6103e8");
+        let gas = estimate(OSAKA_GENESIS, &overrides).await;
+        assert!(
+            gas < 100_000,
+            "estimate {gas} inflated by a nested call that always fails"
+        );
+    }
+
+    /// After Amsterdam (EIP-8037) gas above 2^24 only funds the state gas reservoir. The
+    /// caller gives the storer 30,000 gas, too little for a fresh slot's state gas unless
+    /// the reservoir pays it, so the storer only succeeds above 2^24. The execution at
+    /// 2^24 is then the reference, and the estimate stays below it.
+    #[tokio::test]
+    async fn a_reservoir_funded_nested_call_keeps_the_estimate_below_the_execution_cap() {
+        // `PUSH2 30000`.
+        let overrides = caller_overrides(STORER, STORER_CODE, "617530");
+        let gas = estimate(AMSTERDAM_GENESIS, &overrides).await;
+        assert!(
+            gas < TX_MAX_GAS_LIMIT_AMSTERDAM,
+            "estimate {gas} reaches past 2^24 to fund the nested call from the reservoir"
+        );
+    }
+
+    /// The failed nested calls the estimator counts when `CALLER` runs `code` with no
+    /// balance, on `genesis`.
+    async fn failed_nested_calls(genesis: &str, code: &str) -> u64 {
+        use bytes::Bytes;
+        use ethrex_common::Address;
+        use ethrex_common::types::{GenericTransaction, GenesisAccount, TxKind};
+        use ethrex_vm::backends::ExecutionGasCap;
+
+        let caller = Address::from_str(CALLER).unwrap();
+        let mut genesis: Genesis = serde_json::from_str(genesis).expect("test genesis is invalid");
+        genesis.alloc.insert(
+            caller,
+            GenesisAccount {
+                code: Bytes::from(hex::decode(code.trim_start_matches("0x")).unwrap()),
+                storage: Default::default(),
+                balance: U256::zero(),
+                nonce: 0,
+            },
+        );
+        let mut store =
+            Store::new("test-store", EngineType::InMemory).expect("Fail to create in-memory db");
+        store.add_initial_state(genesis).await.unwrap();
+        let header = store.get_block_header(0).unwrap().expect("genesis header");
+        let context = default_context_with_storage(store.clone()).await;
+        let call = GenericTransaction {
+            from: Address::from_str(SENDER).unwrap(),
+            to: TxKind::Call(caller),
+            gas: Some(1_000_000),
+            ..Default::default()
+        };
+        let (_, failed) = super::simulate_tx_counting_failed_calls(
+            &call,
+            &header,
+            None,
+            store,
+            context.blockchain.clone(),
+            None,
+            ExecutionGasCap::Enforced,
+        )
+        .unwrap();
+        failed
+    }
+
+    /// A nested CALL stopped by its balance check counts as a failed nested call in every
+    /// fork. A CREATE stopped by its balance check counts only before Amsterdam: from
+    /// EIP-8037 the creating frame runs that check before the creation starts, and geth
+    /// counts neither the check nor a creation that never starts.
+    #[tokio::test]
+    async fn a_create_stopped_before_it_starts_counts_only_before_amsterdam() {
+        // With no balance: `PUSH1 0 PUSH1 0 PUSH1 1 CREATE POP`, then
+        // `PUSH1 0 (x4) PUSH1 1 PUSH20 burner GAS CALL POP`, then `STOP`. Both send 1 wei.
+        let code = format!(
+            "0x600060006001f0506000600060006000600173{}5af15000",
+            &BURNER[2..]
+        );
+        assert_eq!(failed_nested_calls(OSAKA_GENESIS, &code).await, 2);
+        assert_eq!(failed_nested_calls(AMSTERDAM_GENESIS, &code).await, 1);
     }
 }

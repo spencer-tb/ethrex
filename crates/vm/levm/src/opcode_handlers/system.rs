@@ -984,7 +984,15 @@ impl<'a> VM<'a> {
                     )?;
                 }
                 self.current_call_frame.stack.push(FAIL)?;
-                self.tracer.exit_early(0, Some(reason.to_string()))?;
+                // From Amsterdam these checks run in the creating frame before the creation
+                // starts (EIP-8037), so gas estimation does not count them as a failed
+                // nested call, as geth does not.
+                if self.env.config.fork >= Fork::Amsterdam {
+                    self.tracer
+                        .exit_early_uncounted(0, Some(reason.to_string()))?;
+                } else {
+                    self.tracer.exit_early(0, Some(reason.to_string()))?;
+                }
                 return Ok(OpcodeResult::Continue);
             }
         }

@@ -838,8 +838,17 @@ mod integration_tests {
 
     /// Runs against the Amsterdam-activated genesis, for EIP-8037 / EIP-7928 behaviour.
     async fn simulate_amsterdam(params: Value) -> Result<Value, RpcErr> {
+        simulate_amsterdam_with_gas_cap(params, crate::DEFAULT_RPC_GAS_CAP).await
+    }
+
+    /// Like `simulate_amsterdam`, on a node started with `--rpc.gascap <rpc_gas_cap>`.
+    async fn simulate_amsterdam_with_gas_cap(
+        params: Value,
+        rpc_gas_cap: u64,
+    ) -> Result<Value, RpcErr> {
         let storage = crate::test_utils::setup_store_amsterdam().await;
-        let context = default_context_with_storage(storage).await;
+        let mut context = default_context_with_storage(storage).await;
+        context.rpc_gas_cap = rpc_gas_cap;
         let request: RpcRequest = serde_json::from_value(json!({
             "jsonrpc": "2.0", "id": 1, "method": "eth_simulateV1", "params": params,
         }))
@@ -1129,6 +1138,105 @@ mod integration_tests {
                 .await
                 .unwrap();
             assert_eq!(result[0]["calls"][0]["status"], "0x1", "cap {rpc_gas_cap}");
+        }
+    }
+
+    /// The request's gas budget never limits a call's explicit `gas` below the base block's
+    /// gas limit, so a transaction that fits in the block can be simulated under a lower
+    /// `--rpc.gascap`. A call without `gas` keeps the cap as its default, and a `gasLimit`
+    /// block override cannot lift the budget.
+    #[tokio::test]
+    async fn explicit_gas_is_never_capped_below_the_block_gas_limit() {
+        const CAP: u64 = 5_000_000;
+        const CONTRACT: &str = "0x000000000000000000000000000000000000c0de";
+        /// `GAS PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN`: returns the gas left at entry.
+        const GAS_LEFT_CODE: &str = "0x5a5f5260205ff3";
+        /// Returns the gas left at entry when it is at least 10,000,000, reverts otherwise.
+        const NEEDS_10M_CODE: &str = "0x5a630098968081106011575f5260205ff35b5f5ffd";
+        let request = |code: &str, gas: Option<&str>, block_gas_limit: Option<&str>| {
+            let mut call = json!({"from": RICH, "to": CONTRACT});
+            if let Some(gas) = gas {
+                call["gas"] = json!(gas);
+            }
+            let mut block = json!({
+                "stateOverrides": {CONTRACT: {"code": code}},
+                "calls": [call],
+            });
+            if let Some(limit) = block_gas_limit {
+                block["blockOverrides"] = json!({"gasLimit": limit});
+            }
+            json!([{"blockStateCalls": [block]}, "latest"])
+        };
+        let gas_left = |result: &Value| {
+            let data = result[0]["calls"][0]["returnData"].as_str().unwrap();
+            u64::from_str_radix(&data[data.len() - 16..], 16).unwrap()
+        };
+
+        // 12M of explicit gas reaches a contract that needs 10M.
+        let result = simulate_with_gas_cap(request(NEEDS_10M_CODE, Some("0xb71b00"), None), CAP)
+            .await
+            .unwrap();
+        assert_eq!(result[0]["calls"][0]["status"], "0x1", "{result}");
+
+        // Without `gas`, the default stays the cap.
+        let result = simulate_with_gas_cap(request(GAS_LEFT_CODE, None, None), CAP)
+            .await
+            .unwrap();
+        assert!(gas_left(&result) < CAP, "{result}");
+
+        // A larger gas limit set through a block override does not lift the budget past
+        // the base block's 25M.
+        let gas = "0x3b9aca00"; // 1,000,000,000
+        let result =
+            simulate_amsterdam_with_gas_cap(request(GAS_LEFT_CODE, Some(gas), Some(gas)), CAP)
+                .await
+                .unwrap();
+        let left = gas_left(&result);
+        assert!(
+            (CAP..=25_000_000).contains(&left),
+            "gas left at entry {left}, want above the cap and at most the base block gas limit"
+        );
+    }
+
+    /// Neither mode caps a call's gas limit per transaction: not at 2^24 before Amsterdam
+    /// (EIP-7825), nor at 2^32 - 1 after it (EIP-8037), as geth does not.
+    #[tokio::test]
+    async fn per_transaction_gas_limit_caps_do_not_apply() {
+        let request = |validation: bool, gas: &str, block_gas_limit: Option<&str>| {
+            let mut block = json!({
+                "calls": [{
+                    "from": RICH,
+                    "to": FRESH_B,
+                    "nonce": "0x0",
+                    "gas": gas,
+                    "maxFeePerGas": "0x77359400",
+                }],
+            });
+            if let Some(limit) = block_gas_limit {
+                block["blockOverrides"] = json!({"gasLimit": limit});
+            }
+            json!([{"validation": validation, "blockStateCalls": [block]}, "latest"])
+        };
+        for validation in [false, true] {
+            // 20M: above 2^24, within the 25M block.
+            let result = simulate(request(validation, "0x1312d00", None))
+                .await
+                .unwrap();
+            assert_eq!(
+                result[0]["calls"][0]["status"], "0x1",
+                "Osaka, validation {validation}: {result}"
+            );
+            // 2^32 in a block that fits it, with no RPC gas cap to lower it.
+            let result = simulate_amsterdam_with_gas_cap(
+                request(validation, "0x100000000", Some("0x200000000")),
+                0,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result[0]["calls"][0]["status"], "0x1",
+                "Amsterdam, validation {validation}: {result}"
+            );
         }
     }
 
