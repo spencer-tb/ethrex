@@ -753,17 +753,24 @@ impl RpcHandler for EstimateGasRequest {
         //
         // After Amsterdam, gas above the EIP-8037 execution cap only feeds the state gas
         // reservoir. A call that completes an inner call only with a reservoir would
-        // otherwise be sized past the cap, so the execution at the cap is the reference
-        // when it succeeds.
-        let mut allowed_failed_calls = failed_calls;
-        if current_fork >= Fork::Amsterdam
-            && highest_gas_limit > TX_MAX_GAS_LIMIT_AMSTERDAM
-            && let Ok((_, failed_at_cap)) = run(TX_MAX_GAS_LIMIT_AMSTERDAM)
-        {
-            allowed_failed_calls = allowed_failed_calls.max(failed_at_cap);
-        }
+        // otherwise be sized past the cap, so for limits up to the cap the execution at the
+        // cap is the reference when it succeeds. Above the cap the execution at the
+        // ceiling stays the reference, since there more gas still buys more reservoir: a
+        // deployment whose inner creations need it must get enough for all of them.
+        let failed_at_cap =
+            if current_fork >= Fork::Amsterdam && highest_gas_limit > TX_MAX_GAS_LIMIT_AMSTERDAM {
+                run(TX_MAX_GAS_LIMIT_AMSTERDAM)
+                    .ok()
+                    .map(|(_, failed)| failed)
+            } else {
+                None
+            };
+        let allowed_failed_calls = |gas: u64| match failed_at_cap {
+            Some(at_cap) if gas <= TX_MAX_GAS_LIMIT_AMSTERDAM => failed_calls.max(at_cap),
+            _ => failed_calls,
+        };
         let mut sufficient =
-            |gas: u64| matches!(run(gas), Ok((_, failed)) if failed <= allowed_failed_calls);
+            |gas: u64| matches!(run(gas), Ok((_, failed)) if failed <= allowed_failed_calls(gas));
 
         let gas_used = result.gas_used();
         let gas_refunded = result.gas_refunded();
@@ -1925,31 +1932,99 @@ mod simulation_gas_cap_tests {
         assert_eq!(word(&output), BLOCK_GAS_LIMIT - ENTRY_OVERHEAD);
     }
 
-    /// A creation that deploys two maximum-size contracts needs more gas than the default
-    /// RPC gas cap (50M) but less than a 200M block gas limit: after Amsterdam most of it
-    /// is the code's state gas, which only the reservoir above 2^24 can pay. The estimate
-    /// lands between the two, as the execution-apis `estimate-above-rpc-cap` test checks.
-    #[tokio::test]
-    async fn estimate_gas_reaches_past_the_rpc_gas_cap_for_a_large_creation() {
-        const BLOCK_GAS_LIMIT: u64 = 200_000_000;
-        // Twice: CREATE a contract whose init code returns 0x6000 zero bytes, then POP.
-        let call = json!({
-            "from": SENDER,
-            "to": null,
-            "input": "0x656160006000f36000526006601a6000f0506006601a6000f05000",
-        });
+    /// The block gas limit the large creation below is estimated on.
+    const LARGE_CREATION_BLOCK_GAS_LIMIT: u64 = 200_000_000;
+    /// Creates, twice, a contract whose init code returns 0x6000 zero bytes, and pops each
+    /// result: `PUSH6 <PUSH2 0x6000 PUSH1 0 RETURN> PUSH1 0 MSTORE`, then
+    /// `PUSH1 6 PUSH1 26 PUSH1 0 CREATE POP` twice, then `STOP`.
+    const LARGE_CREATION_CODE: &str = "0x656160006000f36000526006601a6000f0506006601a6000f05000";
+
+    async fn estimate_large_creation() -> u64 {
+        let call = json!({ "from": SENDER, "to": null, "input": LARGE_CREATION_CODE });
         let estimate = run(
-            &with_block_gas_limit(AMSTERDAM_GENESIS, BLOCK_GAS_LIMIT),
+            &with_block_gas_limit(AMSTERDAM_GENESIS, LARGE_CREATION_BLOCK_GAS_LIMIT),
             DEFAULT_RPC_GAS_CAP,
             "eth_estimateGas",
             vec![call, json!("latest")],
         )
         .await
         .unwrap();
-        let estimate = word(&estimate);
+        word(&estimate)
+    }
+
+    /// A creation that deploys two maximum-size contracts needs more gas than the default
+    /// RPC gas cap (50M) but less than a 200M block gas limit: after Amsterdam most of it
+    /// is the code's state gas, which only the reservoir above 2^24 can pay. The estimate
+    /// lands between the two, as the execution-apis `estimate-above-rpc-cap` test checks.
+    #[tokio::test]
+    async fn estimate_gas_reaches_past_the_rpc_gas_cap_for_a_large_creation() {
+        let estimate = estimate_large_creation().await;
         assert!(
-            (DEFAULT_RPC_GAS_CAP + 1..=BLOCK_GAS_LIMIT).contains(&estimate),
+            (DEFAULT_RPC_GAS_CAP + 1..=LARGE_CREATION_BLOCK_GAS_LIMIT).contains(&estimate),
             "estimate {estimate} must be above the cap and at most the block gas limit"
+        );
+    }
+
+    /// With no reservoir, both inner creations of the large creation fail at 2^24. Above
+    /// 2^24 that count must not be the reference, or the estimate settles where the second
+    /// creation is starved and the pop hides it. Run at the estimate as a validating
+    /// `eth_simulateV1` call, the creation must deploy both contracts.
+    #[tokio::test]
+    async fn a_large_creation_estimate_leaves_both_inner_creations_enough_gas() {
+        use ethrex_common::Address;
+        use ethrex_common::evm::calculate_create_address;
+
+        const CHECKER: &str = "0x000000000000000000000000000000000000c4ec";
+        const FEE: &str = "0x77359400"; // 2 gwei
+        let estimate = estimate_large_creation().await;
+
+        // The creation's own address, then the two contracts it creates with nonces 1 and 2.
+        let deployer = calculate_create_address(Address::from_str(SENDER).unwrap(), 0);
+        let child = |nonce| hex::encode(calculate_create_address(deployer, nonce).as_bytes());
+        // Returns the code sizes of both: `PUSH20 first EXTCODESIZE PUSH0 MSTORE
+        // PUSH20 second EXTCODESIZE PUSH1 0x20 MSTORE PUSH1 0x40 PUSH0 RETURN`.
+        let checker_code = format!("0x73{}3b5f5273{}3b60205260405ff3", child(1), child(2));
+        let params = vec![
+            json!({
+                "validation": true,
+                "blockStateCalls": [{
+                    "stateOverrides": { CHECKER: { "code": checker_code } },
+                    "calls": [
+                        {
+                            "from": SENDER,
+                            "input": LARGE_CREATION_CODE,
+                            "gas": format!("{estimate:#x}"),
+                            "nonce": "0x0",
+                            "maxFeePerGas": FEE,
+                        },
+                        {
+                            "from": SENDER,
+                            "to": CHECKER,
+                            "gas": "0x186a0",
+                            "nonce": "0x1",
+                            "maxFeePerGas": FEE,
+                        },
+                    ],
+                }],
+            }),
+            json!("latest"),
+        ];
+        let result = run(
+            &with_block_gas_limit(AMSTERDAM_GENESIS, LARGE_CREATION_BLOCK_GAS_LIMIT),
+            DEFAULT_RPC_GAS_CAP,
+            "eth_simulateV1",
+            params,
+        )
+        .await
+        .unwrap();
+        let calls = &result[0]["calls"];
+        assert_eq!(calls[0]["status"], "0x1", "{result}");
+        let sizes = calls[1]["returnData"].as_str().expect("hex return data");
+        let size = |word: &str| u64::from_str_radix(word, 16).unwrap();
+        assert_eq!(
+            (size(&sizes[2..66]), size(&sizes[66..130])),
+            (0x6000, 0x6000),
+            "an inner creation is starved at the estimate {estimate}: {result}"
         );
     }
 
