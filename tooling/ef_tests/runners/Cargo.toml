@@ -30,3 +30,7 @@ path = "src/bin/blocktest.rs"
 [[bin]]
 name = "enginetest"
 path = "src/bin/enginetest.rs"
+
+[[bin]]
+name = "buildtest"
+path = "src/bin/buildtest.rs"

@@ -10,7 +10,7 @@ use clap::Parser;
 use ef_tests_blockchain::test_runner::{RunOptions, SKIPPED_TESTS, run_ef_test, skip_reason};
 use ef_tests_blockchain::types::TestUnit;
 use ef_tests_runners::{
-    FixtureResult, RunnerArgs, collect_json_files, install_bal_report, report, run_files,
+    BalArgs, FixtureResult, RunnerArgs, collect_json_files, install_bal_report, report, run_files,
     runner_error,
 };
 
@@ -24,6 +24,9 @@ struct Cli {
     #[command(flatten)]
     runner: RunnerArgs,
 
+    #[command(flatten)]
+    bal: BalArgs,
+
     /// Never deliver the fixture's access list, so every block runs without one and
     /// ethrex checks the list it builds against the header.
     #[arg(long)]
@@ -32,7 +35,7 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    install_bal_report(&cli.runner);
+    install_bal_report(&cli.bal);
     let started = Instant::now();
     let rt = tokio::runtime::Runtime::new().expect("failed to build the tokio runtime");
     let files = match collect_json_files(cli.runner.fixture_paths()) {
@@ -45,7 +48,7 @@ fn main() -> ExitCode {
         }
     };
     let options = RunOptions {
-        bal_parallel_exec: !cli.runner.bal_sequential,
+        bal_parallel_exec: !cli.bal.bal_sequential,
         withhold_access_lists: cli.bal_withhold,
         precompile_cache: !cli.runner.no_precompile_cache,
         check_exception_names: false,
