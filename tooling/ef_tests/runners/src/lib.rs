@@ -1,5 +1,6 @@
-//! Shared plumbing for the standalone `blocktest` and `enginetest` runners: fixture
-//! discovery, the worker pool, the result output and the per-block executor report.
+//! Shared plumbing for the standalone `blocktest`, `enginetest` and `buildtest`
+//! runners: fixture discovery, the worker pool, the result output and the per-block
+//! executor report.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -52,9 +53,9 @@ pub struct RunnerArgs {
     pub no_precompile_cache: bool,
 }
 
-/// Options of the runners that execute a fixture's own blocks, `blocktest` and
-/// `enginetest`. `buildtest` takes none of them: ethrex builds each of its blocks,
-/// deriving the access list itself.
+/// Executor options, taken by `blocktest` and `enginetest`. `buildtest` takes none of
+/// them, as the client test runner interface specifies, and imports on the default
+/// executor.
 #[derive(clap::Args, Debug)]
 pub struct BalArgs {
     /// Run every block on the sequential executor, as the node's `--no-bal-parallel-exec` does.
