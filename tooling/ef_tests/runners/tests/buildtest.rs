@@ -118,6 +118,75 @@ fn a_built_payload_that_differs_is_a_mismatch() {
     assert_ne!(mismatches[0]["got"], block_hash);
 }
 
+/// A copy of `enginetest_bal_report.json` changed by `edit`, in a fresh directory.
+fn edited_copy(test: &str, edit: impl FnOnce(&mut Map<String, Value>)) -> PathBuf {
+    let mut fixtures: Map<String, Value> =
+        serde_json::from_slice(&std::fs::read(fixture("enginetest_bal_report.json")).unwrap())
+            .unwrap();
+    edit(&mut fixtures);
+    let path = scratch(test).join("enginetest_bal_report.json");
+    std::fs::write(&path, serde_json::to_vec(&fixtures).unwrap()).unwrap();
+    path
+}
+
+#[test]
+fn a_mismatch_alone_fails_the_fixture() {
+    // A key the payload decoding ignores but the comparison reads: the payload
+    // still imports as valid, so only the mismatch fails the fixture.
+    let path = edited_copy("buildtest_mismatch_alone", |fixtures| {
+        fixtures["listed"]["engineNewPayloads"][0]["params"][0]["unknownField"] = "0x01".into();
+    });
+
+    let output = run(&[], &[&path]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let result = &results(&output)["listed"];
+    assert_eq!(result["pass"], false, "{result}");
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("build_mismatch"),
+        "{result}"
+    );
+    assert_eq!(result["rejections"], json!([]), "{result}");
+    assert_eq!(
+        result["mismatches"],
+        json!([{"index": 0, "field": "unknownField", "expected": "0x01", "got": null}])
+    );
+}
+
+#[test]
+fn a_refused_build_alone_fails_the_fixture() {
+    // The second copy of the payload builds on a parent that is no longer the
+    // head, which the handler refuses, and imports again as a known block.
+    let path = edited_copy("buildtest_refused_alone", |fixtures| {
+        let payloads = fixtures["listed"]["engineNewPayloads"]
+            .as_array_mut()
+            .unwrap();
+        payloads.push(payloads[0].clone());
+    });
+
+    let output = run(&[], &[&path]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let result = &results(&output)["listed"];
+    assert_eq!(result["pass"], false, "{result}");
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("build_mismatch"),
+        "{result}"
+    );
+    assert_eq!(result["built"], 1, "{result}");
+    assert_eq!(result["mismatches"], json!([]), "{result}");
+    let rejections = result["rejections"].as_array().unwrap();
+    assert_eq!(rejections.len(), 1, "{rejections:?}");
+    assert_eq!(rejections[0]["index"], 1);
+    assert!(rejections[0].get("hash").is_none(), "{rejections:?}");
+}
+
 #[test]
 fn buildtest_takes_no_bal_flags() {
     for flag in ["--bal-sequential", "--bal-report"] {
