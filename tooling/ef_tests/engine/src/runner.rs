@@ -78,6 +78,27 @@ pub struct Rejection {
     pub error: String,
 }
 
+/// What `buildtest` built: the payloads ethrex built and refused to build, and
+/// every field of a fixture's payload in which the built one differs.
+#[derive(Debug, Default)]
+pub struct BuildOutcome {
+    pub built: usize,
+    pub refused: usize,
+    pub mismatches: Vec<Mismatch>,
+}
+
+/// A field in which a payload ethrex built differs from the fixture's, with both
+/// values as they appear in the payload's JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mismatch {
+    /// The payload's position in the fixture's `engineNewPayloads`, from 0.
+    pub index: usize,
+    /// The field's name in the payload JSON, or `executionRequests`.
+    pub field: String,
+    pub expected: Value,
+    pub got: Value,
+}
+
 #[derive(Debug)]
 pub enum FixtureFailure {
     SkippedPreParis,
@@ -144,6 +165,17 @@ pub enum FixtureFailure {
     LastBlockHashMismatch {
         expected: H256,
         got: H256,
+    },
+    /// `testing_buildBlockV1` could not be dispatched or answered `-32601`, as
+    /// opposed to a build ethrex refused, which is a rejection.
+    BuildRpc {
+        index: usize,
+        msg: String,
+    },
+    /// A built payload differed from the fixture's, or ethrex refused to build one.
+    BuildMismatch {
+        mismatches: usize,
+        refused: usize,
     },
 }
 
@@ -232,6 +264,16 @@ impl fmt::Display for FixtureFailure {
                     "lastblockhash_mismatch  expected={expected:#x}  got={got:#x}"
                 )
             }
+            FixtureFailure::BuildRpc { index, msg } => {
+                write!(f, "build_rpc[{index}]  error={msg}")
+            }
+            FixtureFailure::BuildMismatch {
+                mismatches,
+                refused,
+            } => write!(
+                f,
+                "build_mismatch  mismatched_fields={mismatches}  refused_payloads={refused}"
+            ),
         }
     }
 }
@@ -245,6 +287,32 @@ pub async fn run_fixture(
     fix: &EngineFixture,
     opts: &RunOptions,
     rejections: &mut Vec<Rejection>,
+) -> Result<(), FixtureFailure> {
+    run(name, fix, opts, rejections, None).await
+}
+
+/// Run one fixture as `run_fixture` does, first building each payload it expects
+/// to be valid through `testing_buildBlockV1`, on the payload's parent and from
+/// its attributes, transactions and extra data, and comparing the built payload
+/// with the fixture's. A payload the fixture expects to be invalid is neither
+/// built nor sent. A build ethrex refuses is one of `rejections`, and the
+/// fixture's payload is still imported.
+pub async fn run_build_fixture(
+    name: &str,
+    fix: &EngineFixture,
+    opts: &RunOptions,
+    rejections: &mut Vec<Rejection>,
+    build: &mut BuildOutcome,
+) -> Result<(), FixtureFailure> {
+    run(name, fix, opts, rejections, Some(build)).await
+}
+
+async fn run(
+    name: &str,
+    fix: &EngineFixture,
+    opts: &RunOptions,
+    rejections: &mut Vec<Rejection>,
+    mut build: Option<&mut BuildOutcome>,
 ) -> Result<(), FixtureFailure> {
     // 1. Pre-Paris skip
     let fork = fix
@@ -289,6 +357,12 @@ pub async fn run_fixture(
 
     // 5. Per-payload loop (mirrors test_via_engine.py:124–240)
     for (i, payload) in fix.engine_new_payloads.iter().enumerate() {
+        if let Some(build) = build.as_deref_mut() {
+            if !payload.valid() {
+                continue;
+            }
+            Box::pin(build_payload(&harness, i, payload, build, rejections)).await?;
+        }
         // zkevm fixtures carry an expected witness per payload: route those
         // through `engine_newPayloadWithWitnessV{4,5}` (same params, same status
         // semantics as the plain call) so the engine-side witness generation is
@@ -341,6 +415,13 @@ pub async fn run_fixture(
         }
     }
 
+    if let Some(build) = build.filter(|b| !b.mismatches.is_empty() || b.refused > 0) {
+        return Err(FixtureFailure::BuildMismatch {
+            mismatches: build.mismatches.len(),
+            refused: build.refused,
+        });
+    }
+
     // 6. The head the payloads and forkchoice updates left must be `lastblockhash`.
     let block = Box::pin(harness.get_latest_block())
         .await
@@ -357,6 +438,126 @@ pub async fn run_fixture(
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
+
+/// Build payload `index`'s block through `testing_buildBlockV1` and record every
+/// field of the fixture's payload in which the built one differs. The payload's
+/// gas limit is the builder's target: `targetGasLimit` from Amsterdam on, and the
+/// builder's gas ceiling before.
+async fn build_payload(
+    harness: &EngineApiHarness,
+    index: usize,
+    payload: &FixturePayload,
+    build: &mut BuildOutcome,
+    rejections: &mut Vec<Rejection>,
+) -> Result<(), FixtureFailure> {
+    let parse = |msg: String| FixtureFailure::PayloadParse { index, msg };
+    let want = payload
+        .params
+        .first()
+        .ok_or_else(|| parse("engineNewPayload params is empty".to_string()))?;
+    let field = |name: &str| want.get(name).cloned().unwrap_or(Value::Null);
+    let gas_limit = field("gasLimit");
+    let gas_limit = gas_limit
+        .as_str()
+        .and_then(|hex| u64::from_str_radix(hex.trim_start_matches("0x"), 16).ok())
+        .ok_or_else(|| parse(format!("invalid gasLimit {gas_limit}")))?;
+
+    let mut attributes = serde_json::json!({
+        "timestamp": field("timestamp"),
+        "prevRandao": field("prevRandao"),
+        "suggestedFeeRecipient": field("feeRecipient"),
+    });
+    if !field("withdrawals").is_null() {
+        attributes["withdrawals"] = field("withdrawals");
+    }
+    // The parent beacon block root is a newPayload param from V3 on.
+    if payload.new_payload_version >= 3 {
+        attributes["parentBeaconBlockRoot"] = payload.params.get(2).cloned().unwrap_or_default();
+    }
+    // The slot number and the gas limit target are attributes from
+    // forkchoiceUpdatedV4 on. Before, the builder's own gas ceiling is the target.
+    let gas_ceil = if payload.forkchoice_updated_version >= 4 {
+        attributes["slotNumber"] = field("slotNumber");
+        attributes["targetGasLimit"] = field("gasLimit");
+        None
+    } else {
+        Some(gas_limit)
+    };
+    let params = vec![
+        field("parentHash"),
+        attributes,
+        field("transactions"),
+        field("extraData"),
+    ];
+
+    let resp = Box::pin(harness.build_block(params, gas_ceil))
+        .await
+        .map_err(|e| FixtureFailure::BuildRpc {
+            index,
+            msg: e.to_string(),
+        })?;
+    if let Some(error) = resp.get("error") {
+        // A method the dispatcher cannot route is the runner's setup, not a build
+        // ethrex refused.
+        if error.get("code").and_then(Value::as_i64) == Some(-32601) {
+            return Err(FixtureFailure::BuildRpc {
+                index,
+                msg: rejection_error(&resp).unwrap_or_default(),
+            });
+        }
+        rejections.push(Rejection {
+            index,
+            hash: None,
+            error: rejection_error(&resp).unwrap_or_default(),
+        });
+        build.refused += 1;
+        return Ok(());
+    }
+    build.built += 1;
+    let result = resp.get("result").unwrap_or(&Value::Null);
+    let got = result.get("executionPayload").unwrap_or(&Value::Null);
+    let mut compare = |name: &str, expected: &Value, got: &Value| {
+        if !json_equals(expected, got) {
+            build.mismatches.push(Mismatch {
+                index,
+                field: name.to_string(),
+                expected: expected.clone(),
+                got: got.clone(),
+            });
+        }
+    };
+    for (name, expected) in want.as_object().into_iter().flatten() {
+        compare(name, expected, got.get(name).unwrap_or(&Value::Null));
+    }
+    // The execution requests are a newPayload param from V4 on.
+    if payload.new_payload_version >= 4 {
+        compare(
+            "executionRequests",
+            payload.params.get(3).unwrap_or(&Value::Null),
+            result.get("executionRequests").unwrap_or(&Value::Null),
+        );
+    }
+    Ok(())
+}
+
+/// Compare two JSON values as values rather than text: a missing field equals
+/// null, objects compare by their fields in any order, and strings, which carry
+/// the payload's hex, compare regardless of case.
+fn json_equals(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Object(a), Value::Object(b)) => a.keys().chain(b.keys()).all(|key| {
+            json_equals(
+                a.get(key).unwrap_or(&Value::Null),
+                b.get(key).unwrap_or(&Value::Null),
+            )
+        }),
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| json_equals(a, b))
+        }
+        (Value::String(a), Value::String(b)) => a.eq_ignore_ascii_case(b),
+        _ => a == b,
+    }
+}
 
 /// Verify the witness returned by `engine_newPayloadWithWitnessV{4,5}` against the
 /// fixture's expected `executionWitness`. The endpoint returns geth's
@@ -668,6 +869,22 @@ mod tests {
             bal_parallel_exec: true,
             precompile_cache: true,
         }
+    }
+
+    #[test]
+    fn json_values_compare_as_values() {
+        use serde_json::json;
+        assert!(json_equals(
+            &json!({"a": "0xAB", "b": null}),
+            &json!({"a": "0xab"})
+        ));
+        assert!(json_equals(
+            &json!(["0x01", "0x02"]),
+            &json!(["0x01", "0x02"])
+        ));
+        assert!(!json_equals(&json!(["0x01"]), &json!(["0x01", "0x02"])));
+        assert!(!json_equals(&json!({"a": "0x01"}), &json!({"a": "0x02"})));
+        assert!(!json_equals(&json!("0x01"), &Value::Null));
     }
 
     #[test]

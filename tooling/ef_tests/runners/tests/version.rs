@@ -30,3 +30,11 @@ fn enginetest_version_names_client_and_tool() {
         format!("ethrex-enginetest {}\n", env!("CARGO_PKG_VERSION"))
     );
 }
+
+#[test]
+fn buildtest_version_names_client_and_tool() {
+    assert_eq!(
+        version_output(env!("CARGO_BIN_EXE_buildtest")),
+        format!("ethrex-buildtest {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}

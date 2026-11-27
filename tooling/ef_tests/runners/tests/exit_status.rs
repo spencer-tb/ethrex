@@ -129,3 +129,29 @@ fn enginetest_exits_2_on_a_file_that_does_not_parse() {
         "enginetest_exits_2",
     );
 }
+
+#[test]
+fn buildtest_exits_0_when_every_fixture_passes() {
+    exits_0_when_every_fixture_passes(
+        env!("CARGO_BIN_EXE_buildtest"),
+        "enginetest_bal_report.json",
+    );
+}
+
+#[test]
+fn buildtest_exits_1_when_a_fixture_fails() {
+    exits_1_when_a_fixture_fails(
+        env!("CARGO_BIN_EXE_buildtest"),
+        "enginetest_bal_report.json",
+        "buildtest_exits_1",
+    );
+}
+
+#[test]
+fn buildtest_exits_2_on_a_file_that_does_not_parse() {
+    exits_2_on_a_file_that_does_not_parse(
+        env!("CARGO_BIN_EXE_buildtest"),
+        "enginetest_bal_report.json",
+        "buildtest_exits_2",
+    );
+}

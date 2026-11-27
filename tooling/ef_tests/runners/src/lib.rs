@@ -1,5 +1,6 @@
-//! Shared plumbing for the standalone `blocktest` and `enginetest` runners: fixture
-//! discovery, the worker pool, the result output and the per-block executor report.
+//! Shared plumbing for the standalone `blocktest`, `enginetest` and `buildtest`
+//! runners: fixture discovery, the worker pool, the result output and the per-block
+//! executor report.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -46,14 +47,20 @@ pub struct RunnerArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Run every block on the sequential executor, as the node's `--no-bal-parallel-exec` does.
-    #[arg(long)]
-    pub bal_sequential: bool,
-
     /// Run without the per-block precompile result cache, as the node flag of the same
     /// name does.
     #[arg(long, env = "ETHREX_NO_PRECOMPILE_CACHE")]
     pub no_precompile_cache: bool,
+}
+
+/// Executor options, taken by `blocktest` and `enginetest`. `buildtest` takes none of
+/// them, as the client test runner interface specifies, and imports on the default
+/// executor.
+#[derive(clap::Args, Debug)]
+pub struct BalArgs {
+    /// Run every block on the sequential executor, as the node's `--no-bal-parallel-exec` does.
+    #[arg(long)]
+    pub bal_sequential: bool,
 
     /// Print the executor chosen for each block as one JSON line on stderr.
     #[arg(long)]
@@ -82,6 +89,34 @@ pub struct FixtureResult {
     /// gave it. The runner does not check these against the fixture's expected
     /// exception; whoever reads the results can.
     pub rejections: Vec<Rejection>,
+    /// For `buildtest`, the number of payloads ethrex built.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub built: Option<usize>,
+    /// For `buildtest`, every field in which a built payload differs from the
+    /// fixture's, in fixture order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mismatches: Option<Vec<Mismatch>>,
+}
+
+/// A field in which a payload ethrex built differs from the fixture's, with both
+/// values as they appear in the payload's JSON.
+#[derive(Debug, Serialize)]
+pub struct Mismatch {
+    pub index: usize,
+    pub field: String,
+    pub expected: serde_json::Value,
+    pub got: serde_json::Value,
+}
+
+impl From<ef_tests_engine::Mismatch> for Mismatch {
+    fn from(m: ef_tests_engine::Mismatch) -> Self {
+        Self {
+            index: m.index,
+            field: m.field,
+            expected: m.expected,
+            got: m.got,
+        }
+    }
 }
 
 /// A block (in `blocks`) or payload (in `engineNewPayloads`) the client rejected.
@@ -121,6 +156,8 @@ impl FixtureResult {
             fork,
             error: error.unwrap_or_default(),
             rejections: Vec::new(),
+            built: None,
+            mismatches: None,
         }
     }
 
@@ -315,13 +352,13 @@ pub fn report(outcome: &RunOutcome, json: bool, started: Instant) -> ExitCode {
 /// empty for `parallel`, and for `sequential` the first gate that ruled parallel out,
 /// also for a block without a list under `--bal-withhold`.
 /// Without the flag no subscriber is installed.
-pub fn install_bal_report(args: &RunnerArgs) {
+pub fn install_bal_report(args: &BalArgs) {
     if let Some(layer) = bal_report_layer(args, std::io::stderr) {
         tracing_subscriber::registry().with(layer).init();
     }
 }
 
-fn bal_report_layer<S, W>(args: &RunnerArgs, writer: W) -> Option<impl Layer<S>>
+fn bal_report_layer<S, W>(args: &BalArgs, writer: W) -> Option<impl Layer<S>>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
     W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
@@ -434,6 +471,8 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         runner: RunnerArgs,
+        #[command(flatten)]
+        bal: BalArgs,
     }
 
     #[derive(Clone, Default)]
@@ -474,7 +513,7 @@ mod tests {
             .expect("valid arguments");
         let buffer = Buffer::default();
         let subscriber =
-            tracing_subscriber::registry().with(bal_report_layer(&cli.runner, buffer.clone()));
+            tracing_subscriber::registry().with(bal_report_layer(&cli.bal, buffer.clone()));
         tracing::subscriber::with_default(subscriber, || {
             for event in events {
                 match *event {
