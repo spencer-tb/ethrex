@@ -166,8 +166,8 @@ pub enum FixtureFailure {
         expected: H256,
         got: H256,
     },
-    /// `testing_buildBlockV1` could not be dispatched, as opposed to a build
-    /// ethrex refused, which is a rejection.
+    /// `testing_buildBlockV1` could not be dispatched or answered `-32601`, as
+    /// opposed to a build ethrex refused, which is a rejection.
     BuildRpc {
         index: usize,
         msg: String,
@@ -475,11 +475,14 @@ async fn build_payload(
         attributes["parentBeaconBlockRoot"] = payload.params.get(2).cloned().unwrap_or_default();
     }
     // The slot number and the gas limit target are attributes from
-    // forkchoiceUpdatedV4 on.
-    if payload.forkchoice_updated_version >= 4 {
+    // forkchoiceUpdatedV4 on. Before, the builder's own gas ceiling is the target.
+    let gas_ceil = if payload.forkchoice_updated_version >= 4 {
         attributes["slotNumber"] = field("slotNumber");
         attributes["targetGasLimit"] = field("gasLimit");
-    }
+        None
+    } else {
+        Some(gas_limit)
+    };
     let params = vec![
         field("parentHash"),
         attributes,
@@ -487,13 +490,21 @@ async fn build_payload(
         field("extraData"),
     ];
 
-    let resp = Box::pin(harness.build_block(params, gas_limit))
+    let resp = Box::pin(harness.build_block(params, gas_ceil))
         .await
         .map_err(|e| FixtureFailure::BuildRpc {
             index,
             msg: e.to_string(),
         })?;
-    if resp.get("error").is_some() {
+    if let Some(error) = resp.get("error") {
+        // A method the dispatcher cannot route is the runner's setup, not a build
+        // ethrex refused.
+        if error.get("code").and_then(Value::as_i64) == Some(-32601) {
+            return Err(FixtureFailure::BuildRpc {
+                index,
+                msg: rejection_error(&resp).unwrap_or_default(),
+            });
+        }
         rejections.push(Rejection {
             index,
             hash: None,

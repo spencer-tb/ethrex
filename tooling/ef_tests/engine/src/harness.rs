@@ -136,13 +136,19 @@ impl EngineApiHarness {
             .await
     }
 
-    /// Call `testing_buildBlockV1` with `params`, the builder targeting `gas_ceil`
-    /// as a node started with `--builder.gas-limit` does. From Amsterdam on the
-    /// payload attributes' `targetGasLimit` takes precedence.
-    pub async fn build_block(&self, params: Vec<Value>, gas_ceil: u64) -> anyhow::Result<Value> {
+    /// Call `testing_buildBlockV1` with `params`. With `gas_ceil`, the builder
+    /// targets it, as a node started with `--builder.gas-limit` does: the target of
+    /// a block before Amsterdam, whose payload attributes name none.
+    pub async fn build_block(
+        &self,
+        params: Vec<Value>,
+        gas_ceil: Option<u64>,
+    ) -> anyhow::Result<Value> {
         let req = RpcRequest::new("testing_buildBlockV1", Some(params));
         let mut ctx = self.ctx.clone();
-        ctx.gas_ceil = gas_ceil;
+        if let Some(gas_ceil) = gas_ceil {
+            ctx.gas_ceil = gas_ceil;
+        }
         let res = map_http_requests(&req, ctx).await;
         Ok(rpc_response(req.id.clone(), res)?)
     }
